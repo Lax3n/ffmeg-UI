@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
+/.claude/
+tmpclaude-*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# FFmpeg temporary files
+ffmpeg_ui_frame_*.png
+ffmpeg_ui_audio_*.wav
+ffmpeg_ui_waveform.raw
