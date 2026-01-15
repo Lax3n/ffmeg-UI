@@ -1,5 +1,5 @@
 use crate::project::ExportSettings;
-use crate::ui::FilterSettings;
+use crate::ui::{FilterSettings, TrimMode};
 use std::path::PathBuf;
 
 /// Build FFmpeg arguments for conversion
@@ -54,31 +54,84 @@ pub fn build_convert_args(
     args
 }
 
-/// Build FFmpeg arguments for trimming
+/// Build FFmpeg arguments for trimming with different modes
 pub fn build_trim_args(
     input: &PathBuf,
     output: &PathBuf,
     start: f64,
     end: f64,
-    copy_codec: bool,
+    mode: TrimMode,
 ) -> Vec<String> {
-    let mut args = vec![
-        "-y".to_string(),
-        "-ss".to_string(),
-        start.to_string(),
-        "-i".to_string(),
-        input.to_string_lossy().to_string(),
-        "-t".to_string(),
-        (end - start).to_string(),
-    ];
+    let duration = end - start;
 
-    if copy_codec {
-        args.push("-c".to_string());
-        args.push("copy".to_string());
+    match mode {
+        TrimMode::Lossless => {
+            // -c copy: pas de ré-encodage, coupe aux keyframes (~instantané)
+            // -ss AVANT -i pour seeking rapide
+            vec![
+                "-y".to_string(),
+                "-ss".to_string(),
+                format!("{:.3}", start),
+                "-i".to_string(),
+                input.to_string_lossy().to_string(),
+                "-t".to_string(),
+                format!("{:.3}", duration),
+                "-c".to_string(),
+                "copy".to_string(),
+                "-avoid_negative_ts".to_string(),
+                "make_zero".to_string(),
+                output.to_string_lossy().to_string(),
+            ]
+        }
+        TrimMode::Precise => {
+            // Ré-encodage ultrafast pour coupe précise mais rapide
+            // -ss APRÈS -i pour précision à la frame
+            vec![
+                "-y".to_string(),
+                "-i".to_string(),
+                input.to_string_lossy().to_string(),
+                "-ss".to_string(),
+                format!("{:.3}", start),
+                "-t".to_string(),
+                format!("{:.3}", duration),
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "ultrafast".to_string(),
+                "-crf".to_string(),
+                "18".to_string(),
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                "192k".to_string(),
+                output.to_string_lossy().to_string(),
+            ]
+        }
+        TrimMode::HighQuality => {
+            // Ré-encodage complet haute qualité
+            // -ss APRÈS -i pour précision maximale
+            vec![
+                "-y".to_string(),
+                "-i".to_string(),
+                input.to_string_lossy().to_string(),
+                "-ss".to_string(),
+                format!("{:.3}", start),
+                "-t".to_string(),
+                format!("{:.3}", duration),
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "slow".to_string(),
+                "-crf".to_string(),
+                "18".to_string(),
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                "256k".to_string(),
+                output.to_string_lossy().to_string(),
+            ]
+        }
     }
-
-    args.push(output.to_string_lossy().to_string());
-    args
 }
 
 /// Build FFmpeg arguments for cropping

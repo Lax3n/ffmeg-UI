@@ -1,3 +1,4 @@
+use crate::export_queue::{ExportQueue, JobStatus, SharedQueue, create_shared_queue};
 use crate::ffmpeg::{FFmpegWrapper, TaskProgress};
 use crate::player::{MediaPlayer, PlaybackState, WaveformData};
 use crate::project::{ExportSettings, MediaFile, Project};
@@ -32,6 +33,10 @@ pub struct FFmpegApp {
     pub timeline_scroll: f32,
     pub in_point: Option<f64>,
     pub out_point: Option<f64>,
+
+    // Export queue
+    pub export_queue: SharedQueue,
+    pub show_queue_panel: bool,
 }
 
 impl FFmpegApp {
@@ -61,6 +66,10 @@ impl FFmpegApp {
             timeline_scroll: 0.0,
             in_point: None,
             out_point: None,
+
+            // Export queue
+            export_queue: create_shared_queue(),
+            show_queue_panel: false,
         }
     }
 
@@ -221,6 +230,106 @@ impl FFmpegApp {
         self.out_point = None;
     }
 
+    /// Add current trim settings to the export queue
+    pub fn add_trim_to_queue(&mut self) {
+        let Some(file) = self.selected_file() else {
+            self.status_message = "No file selected".to_string();
+            return;
+        };
+
+        let input_path = file.path.clone();
+        let output_path = self.get_output_path_for_queue(&input_path);
+        let trim = self.trim_settings.clone();
+
+        {
+            let mut queue = self.export_queue.lock().unwrap();
+            queue.add_trim(
+                input_path,
+                output_path,
+                trim.start_time,
+                trim.end_time,
+                trim.mode,
+            );
+        }
+
+        self.status_message = format!(
+            "Added to queue ({} jobs pending)",
+            self.export_queue.lock().unwrap().pending_count()
+        );
+        self.show_queue_panel = true;
+    }
+
+    /// Process the next job in the queue
+    pub fn process_queue(&mut self) {
+        let queue = self.export_queue.clone();
+        let ffmpeg = self.ffmpeg.clone();
+
+        // Check if already processing
+        {
+            let q = queue.lock().unwrap();
+            if q.is_processing || !q.has_pending() {
+                return;
+            }
+        }
+
+        // Get next job
+        let job_info = {
+            let mut q = queue.lock().unwrap();
+            q.is_processing = true;
+            if let Some(job) = q.next_pending() {
+                job.status = JobStatus::Running;
+                Some((job.id, job.input.clone(), job.output.clone(), job.operation.clone()))
+            } else {
+                q.is_processing = false;
+                None
+            }
+        };
+
+        if let Some((job_id, input, output, operation)) = job_info {
+            self.status_message = "Processing queue...".to_string();
+
+            self.runtime.spawn(async move {
+                let result = match operation {
+                    crate::export_queue::ExportOperation::Trim { start, end, mode } => {
+                        ffmpeg.trim(&input, &output, start, end, mode).await
+                    }
+                };
+
+                let mut q = queue.lock().unwrap();
+                if let Some(job) = q.get_job_mut(job_id) {
+                    match result {
+                        Ok(_) => {
+                            job.status = JobStatus::Completed;
+                            job.progress = 1.0;
+                        }
+                        Err(e) => {
+                            job.status = JobStatus::Failed(e.to_string());
+                        }
+                    }
+                }
+                q.is_processing = false;
+            });
+        }
+    }
+
+    /// Get output path for queue (auto-numbered)
+    fn get_output_path_for_queue(&self, input: &PathBuf) -> PathBuf {
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = self.get_extension(input);
+        let parent = input.parent().unwrap_or(std::path::Path::new("."));
+
+        // Find next available number
+        let queue = self.export_queue.lock().unwrap();
+        let count = queue.jobs.len();
+        parent.join(format!("{}_cut_{}.{}", stem, count + 1, ext))
+    }
+
+    /// Clear finished jobs from queue
+    pub fn clear_finished_jobs(&mut self) {
+        let mut queue = self.export_queue.lock().unwrap();
+        queue.clear_finished();
+    }
+
     /// Update player state and get current frame
     pub fn update_player(&mut self, ctx: &egui::Context) {
         if let Some(ref player) = self.player {
@@ -308,12 +417,13 @@ impl FFmpegApp {
         let trim = self.trim_settings.clone();
         let ffmpeg = self.ffmpeg.clone();
 
-        self.status_message = format!("Trimming from {} to {}...", trim.start_time, trim.end_time);
+        let mode_name = trim.mode.name();
+        self.status_message = format!("Trimming ({})...", mode_name);
 
         self.runtime.spawn(async move {
             *task_progress.lock().unwrap() = Some(TaskProgress::new("Trimming"));
 
-            let result = ffmpeg.trim(&input_path, &output_path, trim.start_time, trim.end_time, trim.copy_codec).await;
+            let result = ffmpeg.trim(&input_path, &output_path, trim.start_time, trim.end_time, trim.mode).await;
 
             let mut progress = task_progress.lock().unwrap();
             if let Some(ref mut p) = *progress {
@@ -409,6 +519,77 @@ impl FFmpegApp {
             .to_string()
     }
 
+    /// Open current file in LosslessCut (if installed)
+    pub fn open_in_losslesscut(&self) {
+        if let Some(file) = self.selected_file() {
+            let path = file.path.clone();
+
+            #[cfg(windows)]
+            {
+                // Try common installation paths on Windows
+                let possible_paths = [
+                    "LosslessCut.exe",
+                    r"C:\Program Files\LosslessCut\LosslessCut.exe",
+                    r"C:\Program Files (x86)\LosslessCut\LosslessCut.exe",
+                ];
+
+                for exe_path in possible_paths {
+                    if std::process::Command::new(exe_path)
+                        .arg(&path)
+                        .spawn()
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+
+                // Fallback: try via cmd (if in PATH)
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", "LosslessCut"])
+                    .arg(&path)
+                    .spawn();
+            }
+
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("losslesscut")
+                    .arg(&path)
+                    .spawn();
+            }
+        }
+    }
+
+    /// Open current file in mpv (if installed)
+    pub fn open_in_mpv(&self) {
+        if let Some(file) = self.selected_file() {
+            let path = file.path.clone();
+            let start_time = self.current_time;
+
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("mpv")
+                    .arg(format!("--start={}", start_time))
+                    .arg(&path)
+                    .spawn();
+            }
+
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("mpv")
+                    .arg(format!("--start={}", start_time))
+                    .arg(&path)
+                    .spawn();
+            }
+        }
+    }
+
+    /// Open current file in system default player
+    pub fn open_in_default_player(&self) {
+        if let Some(file) = self.selected_file() {
+            let _ = open::that(&file.path);
+        }
+    }
+
     /// Handle keyboard shortcuts
     pub fn handle_input(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
@@ -463,6 +644,9 @@ impl eframe::App for FFmpegApp {
         // Update player
         self.update_player(ctx);
 
+        // Process export queue
+        self.process_queue();
+
         // Render UI
         crate::ui::render_main_window(self, ctx);
 
@@ -474,7 +658,10 @@ impl eframe::App for FFmpegApp {
         }
 
         // Request repaint for progress updates
-        if self.current_task.lock().map(|p| p.is_some()).unwrap_or(false) {
+        let needs_repaint = self.current_task.lock().map(|p| p.is_some()).unwrap_or(false)
+            || self.export_queue.lock().map(|q| q.is_processing || q.has_pending()).unwrap_or(false);
+
+        if needs_repaint {
             ctx.request_repaint();
         }
     }

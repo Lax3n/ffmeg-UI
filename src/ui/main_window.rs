@@ -1,7 +1,7 @@
 use crate::app::FFmpegApp;
 use crate::player::PlaybackState;
 use crate::project::{ExportPreset, SUPPORTED_AUDIO_FORMATS, SUPPORTED_VIDEO_FORMATS};
-use crate::ui::{ActiveTool, CropPreset, TimelineWidget};
+use crate::ui::{ActiveTool, CropPreset, TimelineWidget, TrimMode};
 use crate::utils::format_time;
 use eframe::egui;
 
@@ -32,6 +32,16 @@ pub fn render_main_window(app: &mut FFmpegApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             render_file_panel(app, ui);
         });
+
+    // Right panel - Export queue (when visible)
+    if app.show_queue_panel {
+        egui::SidePanel::right("queue_panel")
+            .default_width(300.0)
+            .min_width(200.0)
+            .show(ctx, |ui| {
+                render_queue_panel(app, ui);
+            });
+    }
 
     // Central panel
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -114,6 +124,32 @@ fn render_menu_bar(app: &mut FFmpegApp, ui: &mut egui::Ui) {
             }
             if ui.button("Clear In/Out Points").clicked() {
                 app.clear_in_out_points();
+                ui.close_menu();
+            }
+        });
+
+        ui.menu_button("Tools", |ui| {
+            let has_file = app.selected_file().is_some();
+
+            if ui.add_enabled(has_file, egui::Button::new("Open in LosslessCut"))
+                .on_hover_text("Open in LosslessCut for precise cutting")
+                .clicked()
+            {
+                app.open_in_losslesscut();
+                ui.close_menu();
+            }
+            if ui.add_enabled(has_file, egui::Button::new("Open in mpv"))
+                .on_hover_text("Open in mpv for smooth preview")
+                .clicked()
+            {
+                app.open_in_mpv();
+                ui.close_menu();
+            }
+            if ui.add_enabled(has_file, egui::Button::new("Open in Default Player"))
+                .on_hover_text("Open with system default application")
+                .clicked()
+            {
+                app.open_in_default_player();
                 ui.close_menu();
             }
         });
@@ -534,17 +570,75 @@ fn render_trim_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         let trim_duration = app.trim_settings.end_time - app.trim_settings.start_time;
         ui.label(format_time(trim_duration.max(0.0)));
         ui.end_row();
+    });
 
-        ui.label("");
-        ui.checkbox(&mut app.trim_settings.copy_codec, "Fast mode (copy codec)");
-        ui.end_row();
+    ui.separator();
+
+    // Mode de trim avec radio buttons
+    ui.label("Export Mode:");
+    ui.indent("trim_mode_indent", |ui| {
+        for mode in TrimMode::all() {
+            let is_selected = app.trim_settings.mode == *mode;
+            if ui.radio(is_selected, mode.name()).clicked() {
+                app.trim_settings.mode = *mode;
+            }
+            if is_selected {
+                ui.indent("mode_desc", |ui| {
+                    ui.small(mode.description());
+                });
+            }
+        }
     });
 
     ui.separator();
 
     ui.horizontal(|ui| {
-        if ui.button("Trim").clicked() {
+        let button_text = match app.trim_settings.mode {
+            TrimMode::Lossless => "Cut (instant)",
+            TrimMode::Precise => "Cut (fast)",
+            TrimMode::HighQuality => "Cut (quality)",
+        };
+        if ui.button(button_text).clicked() {
             app.execute_current_tool();
+        }
+
+        if ui.button("+ Add to Queue")
+            .on_hover_text("Add this cut to the export queue")
+            .clicked()
+        {
+            app.add_trim_to_queue();
+        }
+
+        // Show queue status
+        let queue = app.export_queue.lock().unwrap();
+        let pending = queue.pending_count();
+        let completed = queue.completed_count();
+        drop(queue);
+
+        if pending > 0 || completed > 0 {
+            ui.separator();
+            let queue_text = format!("Queue: {} pending, {} done", pending, completed);
+            if ui.button(&queue_text).clicked() {
+                app.show_queue_panel = !app.show_queue_panel;
+            }
+        }
+    });
+
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        // Quick access to external tools
+        if ui.button("LosslessCut")
+            .on_hover_text("Open in LosslessCut (requires installation)")
+            .clicked()
+        {
+            app.open_in_losslesscut();
+        }
+        if ui.button("mpv")
+            .on_hover_text("Preview in mpv (requires installation)")
+            .clicked()
+        {
+            app.open_in_mpv();
         }
     });
 }
@@ -713,4 +807,79 @@ fn render_filters_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
             app.execute_current_tool();
         }
     });
+}
+
+fn render_queue_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.heading("Export Queue");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("X").clicked() {
+                app.show_queue_panel = false;
+            }
+        });
+    });
+
+    ui.separator();
+
+    // Queue stats
+    let (pending, completed, is_processing) = {
+        let queue = app.export_queue.lock().unwrap();
+        (queue.pending_count(), queue.completed_count(), queue.is_processing)
+    };
+
+    ui.horizontal(|ui| {
+        if is_processing {
+            ui.spinner();
+            ui.label("Processing...");
+        } else if pending > 0 {
+            ui.label(format!("{} jobs pending", pending));
+        } else {
+            ui.label("Queue empty");
+        }
+    });
+
+    if completed > 0 {
+        ui.horizontal(|ui| {
+            ui.label(format!("{} completed", completed));
+            if ui.small_button("Clear done").clicked() {
+                app.clear_finished_jobs();
+            }
+        });
+    }
+
+    ui.separator();
+
+    // Job list
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let jobs: Vec<_> = {
+                let queue = app.export_queue.lock().unwrap();
+                queue.jobs.iter().map(|j| (j.id, j.description(), j.status_text().to_string(), j.status.clone())).collect()
+            };
+
+            for (id, desc, status_text, status) in jobs {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        // Status indicator
+                        let color = match &status {
+                            crate::export_queue::JobStatus::Pending => egui::Color32::GRAY,
+                            crate::export_queue::JobStatus::Running => egui::Color32::YELLOW,
+                            crate::export_queue::JobStatus::Completed => egui::Color32::GREEN,
+                            crate::export_queue::JobStatus::Failed(_) => egui::Color32::RED,
+                        };
+                        ui.colored_label(color, "●");
+                        ui.label(&status_text);
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("x").clicked() {
+                                let mut queue = app.export_queue.lock().unwrap();
+                                queue.remove_job(id);
+                            }
+                        });
+                    });
+                    ui.small(&desc);
+                });
+            }
+        });
 }

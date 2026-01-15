@@ -1,7 +1,7 @@
 use super::commands::*;
 use super::probe::{probe_file, MediaInfo};
 use crate::project::ExportSettings;
-use crate::ui::FilterSettings;
+use crate::ui::{FilterSettings, TrimMode};
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -63,9 +63,9 @@ impl FFmpegWrapper {
         output: &PathBuf,
         start: f64,
         end: f64,
-        copy_codec: bool,
+        mode: TrimMode,
     ) -> Result<()> {
-        let args = build_trim_args(input, output, start, end, copy_codec);
+        let args = build_trim_args(input, output, start, end, mode);
         self.execute_ffmpeg(&args).await
     }
 

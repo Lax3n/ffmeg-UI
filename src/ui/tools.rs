@@ -1,5 +1,39 @@
 use serde::{Deserialize, Serialize};
 
+/// Mode de trim - détermine la vitesse vs précision du cut
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TrimMode {
+    /// Lossless: -c copy, coupe aux keyframes (~instantané)
+    #[default]
+    Lossless,
+    /// Précis avec ré-encodage ultrafast (quelques secondes)
+    Precise,
+    /// Ré-encodage complet haute qualité (plus lent)
+    HighQuality,
+}
+
+impl TrimMode {
+    pub fn all() -> &'static [TrimMode] {
+        &[TrimMode::Lossless, TrimMode::Precise, TrimMode::HighQuality]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            TrimMode::Lossless => "Lossless (instantané)",
+            TrimMode::Precise => "Précis (rapide)",
+            TrimMode::HighQuality => "Haute qualité (lent)",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            TrimMode::Lossless => "Coupe aux keyframes, pas de ré-encodage (~1 sec)",
+            TrimMode::Precise => "Ré-encode en ultrafast, coupe précise (~10 sec)",
+            TrimMode::HighQuality => "Ré-encode complet, qualité maximale (~1 min+)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTool {
     Convert,
@@ -45,7 +79,7 @@ impl ActiveTool {
 pub struct TrimSettings {
     pub start_time: f64,
     pub end_time: f64,
-    pub copy_codec: bool,
+    pub mode: TrimMode,
     pub start_time_str: String,
     pub end_time_str: String,
 }
@@ -55,7 +89,7 @@ impl Default for TrimSettings {
         Self {
             start_time: 0.0,
             end_time: 10.0,
-            copy_codec: true,
+            mode: TrimMode::Lossless, // Par défaut: export instantané
             start_time_str: "00:00.000".to_string(),
             end_time_str: "00:10.000".to_string(),
         }

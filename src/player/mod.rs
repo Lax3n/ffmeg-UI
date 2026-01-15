@@ -1,10 +1,18 @@
 mod video_decoder;
 mod sync;
 mod audio_player;
+mod stream_decoder;
+
+#[cfg(feature = "mpv")]
+mod mpv_player;
 
 pub use video_decoder::*;
 pub use sync::*;
 pub use audio_player::*;
+pub use stream_decoder::*;
+
+#[cfg(feature = "mpv")]
+pub use mpv_player::MpvPlayer;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -170,14 +178,16 @@ impl MediaPlayer {
         }
     }
 
-    /// Extract a frame at the given timestamp
+    /// Extract a frame at the given timestamp with prefetching
     fn extract_frame_at(&self, time: f64) {
         // Check cache first
         {
             let cache = self.frame_cache.lock();
             for (t, frame) in cache.iter() {
-                if (t - time).abs() < 0.1 {
+                if (t - time).abs() < 0.05 {
                     *self.current_frame.lock() = Some(frame.clone());
+                    // Still prefetch ahead
+                    self.prefetch_frames(time);
                     return;
                 }
             }
@@ -196,12 +206,51 @@ impl MediaPlayer {
                 {
                     let mut cache = frame_cache.lock();
                     cache.push((time, frame.clone()));
-                    // Keep cache small
-                    if cache.len() > 30 {
+                    // Keep cache larger
+                    if cache.len() > 60 {
                         cache.remove(0);
                     }
                 }
                 *current_frame.lock() = Some(frame);
+            }
+        });
+
+        // Prefetch upcoming frames
+        self.prefetch_frames(time);
+    }
+
+    /// Prefetch frames ahead of current time
+    fn prefetch_frames(&self, current_time: f64) {
+        let path = self.path.clone();
+        let frame_cache = self.frame_cache.clone();
+        let width = self.width;
+        let height = self.height;
+        let duration = self.duration;
+
+        std::thread::spawn(move || {
+            // Prefetch next 5 frames at 0.2s intervals
+            for i in 1..=5 {
+                let prefetch_time = current_time + (i as f64 * 0.2);
+                if prefetch_time > duration {
+                    break;
+                }
+
+                // Check if already cached
+                {
+                    let cache = frame_cache.lock();
+                    if cache.iter().any(|(t, _)| (t - prefetch_time).abs() < 0.05) {
+                        continue;
+                    }
+                }
+
+                // Extract and cache
+                if let Ok(frame) = extract_frame_cli(&path, prefetch_time, width, height) {
+                    let mut cache = frame_cache.lock();
+                    cache.push((prefetch_time, frame));
+                    if cache.len() > 60 {
+                        cache.remove(0);
+                    }
+                }
             }
         });
     }
@@ -285,41 +334,47 @@ impl MediaPlayer {
     }
 }
 
-/// Extract a single frame using FFmpeg CLI
-fn extract_frame_cli(path: &PathBuf, time: f64, width: u32, height: u32) -> Result<VideoFrame, String> {
-    let temp_path = std::env::temp_dir().join(format!("ffmpeg_ui_frame_{}.png", time as u64));
+/// Extract a single frame using FFmpeg CLI with raw video pipe (FAST)
+fn extract_frame_cli(path: &PathBuf, time: f64, target_width: u32, target_height: u32) -> Result<VideoFrame, String> {
+    // Use rawvideo output to pipe - no temp files, no PNG encoding/decoding
+    // Scale down for preview performance
+    let preview_width = target_width.min(854);  // Max 480p width for preview
+    let preview_height = target_height.min(480);
 
     let output = std::process::Command::new("ffmpeg")
         .args([
-            "-y",
-            "-ss", &time.to_string(),
+            "-ss", &format!("{:.3}", time),  // Seek BEFORE input (fast)
             "-i",
         ])
         .arg(path)
         .args([
             "-vframes", "1",
-            "-f", "image2",
+            "-vf", &format!("scale={}:{}", preview_width, preview_height),
+            "-f", "rawvideo",
+            "-pix_fmt", "rgba",
+            "-",  // Output to stdout
         ])
-        .arg(&temp_path)
         .output()
         .map_err(|e| format!("FFmpeg error: {}", e))?;
 
     if !output.status.success() {
-        return Err("FFmpeg failed to extract frame".to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFmpeg failed: {}", stderr.lines().last().unwrap_or("unknown error")));
     }
 
-    // Read the image
-    let img = image::open(&temp_path)
-        .map_err(|e| format!("Failed to open frame: {}", e))?;
-    let rgba = img.to_rgba8();
-
-    // Clean up
-    let _ = std::fs::remove_file(&temp_path);
+    let expected_size = (preview_width * preview_height * 4) as usize;
+    if output.stdout.len() != expected_size {
+        return Err(format!(
+            "Unexpected frame size: got {} bytes, expected {}",
+            output.stdout.len(),
+            expected_size
+        ));
+    }
 
     Ok(VideoFrame {
-        data: rgba.to_vec(),
-        width: rgba.width(),
-        height: rgba.height(),
+        data: output.stdout,
+        width: preview_width,
+        height: preview_height,
         pts: time,
     })
 }
