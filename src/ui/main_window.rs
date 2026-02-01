@@ -29,6 +29,16 @@ pub fn render_main_window(app: &mut FFmpegApp, ctx: &egui::Context) {
             render_timeline_panel(app, ui);
         });
 
+    // Left panel: file list
+    egui::SidePanel::left("file_list_panel")
+        .resizable(true)
+        .default_width(200.0)
+        .min_width(140.0)
+        .max_width(350.0)
+        .show(ctx, |ui| {
+            render_file_list_panel(app, ui);
+        });
+
     // Central panel: preview + controls + segments/settings
     egui::CentralPanel::default().show(ctx, |ui| {
         // Preview area (top ~40%)
@@ -260,12 +270,19 @@ fn render_playback_controls(app: &mut FFmpegApp, ui: &mut egui::Ui) {
 
         ui.style_mut().spacing.slider_width = ui.available_width() - 20.0;
 
-        if ui.add(
+        let slider_response = ui.add(
             egui::Slider::new(&mut current, 0.0..=duration.max(0.001))
                 .show_value(false)
                 .trailing_fill(true)
-        ).changed() {
+        );
+
+        if slider_response.changed() {
             app.seek(current);
+        }
+
+        // Request continuous repaint while dragging for instant feedback
+        if slider_response.dragged() || slider_response.changed() {
+            ui.ctx().request_repaint();
         }
     });
 }
@@ -280,6 +297,7 @@ fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         .scroll(app.timeline_scroll)
         .segments(&app.segments)
         .selected_segment(app.selected_segment)
+        .waveform_data(&app.current_waveform)
         .show(ui);
 
     if let Some(time) = response.seek_to {
@@ -297,6 +315,88 @@ fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     if response.is_scrubbing {
         ui.ctx().request_repaint();
     }
+}
+
+fn render_file_list_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.heading("Files");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("+").on_hover_text("Open Video... (Ctrl+O)").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm", "ts", "flv"])
+                    .add_filter("All Files", &["*"])
+                    .pick_files()
+                {
+                    app.add_files(paths);
+                }
+            }
+        });
+    });
+
+    ui.separator();
+
+    if app.project.files.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            ui.label("No files loaded");
+            ui.small("Drag & drop or File > Open");
+        });
+        return;
+    }
+
+    let mut select_idx: Option<usize> = None;
+    let mut remove_idx: Option<usize> = None;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .id_salt("file_list_scroll")
+        .show(ui, |ui| {
+            for (i, file) in app.project.files.iter().enumerate() {
+                let is_selected = app.selected_file_index == Some(i);
+
+                ui.horizontal(|ui| {
+                    let label = egui::RichText::new(file.filename())
+                        .small();
+                    let response = ui.selectable_label(is_selected, label);
+                    if response.clicked() {
+                        select_idx = Some(i);
+                    }
+                    response.on_hover_text(format!(
+                        "{}\n{} | {}",
+                        file.path.display(),
+                        file.resolution_string(),
+                        file.duration_string(),
+                    ));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("x").on_hover_text("Remove file").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                });
+            }
+        });
+
+    if let Some(idx) = select_idx {
+        app.save_current_segments();
+        app.select_file(idx);
+    }
+    if let Some(idx) = remove_idx {
+        app.remove_file_at(idx);
+    }
+
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        if !app.project.files.is_empty() {
+            if ui.button("Remove All").on_hover_text("Remove all imported files").clicked() {
+                app.remove_all_files();
+            }
+        }
+    });
+
+    // Show file count
+    ui.small(format!("{} file(s)", app.project.files.len()));
 }
 
 fn render_segment_list(app: &mut FFmpegApp, ui: &mut egui::Ui) {
@@ -369,6 +469,25 @@ fn render_segment_list(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         if ui.button("Deselect All").clicked() {
             for seg in &mut app.segments {
                 seg.enabled = false;
+            }
+        }
+    });
+
+    // Split segment at playhead
+    ui.horizontal(|ui| {
+        let can_split = app.selected_segment.map_or(false, |idx| {
+            app.segments.get(idx).map_or(false, |seg| {
+                app.current_time > seg.start_time && app.current_time < seg.end_time
+            })
+        });
+
+        if ui
+            .add_enabled(can_split, egui::Button::new("Split at Playhead"))
+            .on_hover_text("Split the selected segment at the current playhead position")
+            .clicked()
+        {
+            if let Some(idx) = app.selected_segment {
+                app.split_segment_at(idx, app.current_time);
             }
         }
     });

@@ -24,6 +24,7 @@ pub struct TimelineWidget<'a> {
     pub scroll: f32,
     pub segments: &'a [SplitSegment],
     pub selected_segment: Option<usize>,
+    pub waveform_data: &'a [f32],
 }
 
 impl<'a> TimelineWidget<'a> {
@@ -37,6 +38,7 @@ impl<'a> TimelineWidget<'a> {
             scroll: 0.0,
             segments: &[],
             selected_segment: None,
+            waveform_data: &[],
         }
     }
 
@@ -67,6 +69,11 @@ impl<'a> TimelineWidget<'a> {
 
     pub fn selected_segment(mut self, selected: Option<usize>) -> Self {
         self.selected_segment = selected;
+        self
+    }
+
+    pub fn waveform_data(mut self, data: &'a [f32]) -> Self {
+        self.waveform_data = data;
         self
     }
 
@@ -226,8 +233,61 @@ impl<'a> TimelineWidget<'a> {
         }
     }
 
-    fn draw_waveform(&self, painter: &egui::Painter, rect: egui::Rect, _scroll_time: f64, _visible_duration: f64) {
+    fn draw_waveform(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
+
+        if self.waveform_data.is_empty() || self.duration <= 0.0 {
+            return;
+        }
+
+        let samples_per_second = self.waveform_data.len() as f64 / self.duration;
+        let width_pixels = rect.width() as usize;
+        let center_y = rect.center().y;
+        let half_height = rect.height() / 2.0 - 2.0;
+
+        let bar_color = egui::Color32::from_rgb(80, 180, 80);
+        let bar_color_dim = egui::Color32::from_rgba_unmultiplied(80, 180, 80, 100);
+
+        for px in 0..width_pixels {
+            let t_start = scroll_time + (px as f64 / width_pixels as f64) * visible_duration;
+            let t_end = scroll_time + ((px + 1) as f64 / width_pixels as f64) * visible_duration;
+
+            let idx_start = (t_start * samples_per_second) as usize;
+            let idx_end = ((t_end * samples_per_second) as usize + 1).min(self.waveform_data.len());
+
+            if idx_start >= self.waveform_data.len() || idx_start >= idx_end {
+                continue;
+            }
+
+            let peak = self.waveform_data[idx_start..idx_end]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+
+            if peak < 0.005 {
+                continue;
+            }
+
+            let bar_height = peak * half_height;
+            let x = rect.left() + px as f32;
+
+            // Dim background bar for depth
+            painter.line_segment(
+                [egui::pos2(x, center_y - bar_height * 1.1), egui::pos2(x, center_y + bar_height * 1.1)],
+                egui::Stroke::new(1.0, bar_color_dim),
+            );
+            // Main bar
+            painter.line_segment(
+                [egui::pos2(x, center_y - bar_height), egui::pos2(x, center_y + bar_height)],
+                egui::Stroke::new(1.0, bar_color),
+            );
+        }
+
+        // Center line
+        painter.line_segment(
+            [egui::pos2(rect.left(), center_y), egui::pos2(rect.right(), center_y)],
+            egui::Stroke::new(0.5, egui::Color32::from_gray(60)),
+        );
     }
 
     fn draw_segments(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {

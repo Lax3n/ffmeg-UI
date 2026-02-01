@@ -194,28 +194,13 @@ fn decoder_thread(
     let mut process: Option<Child> = None;
 
     loop {
-        // Drain all pending commands (non-blocking)
+        // Drain all pending commands (non-blocking), coalescing multiple seeks
+        let mut last_seek: Option<f64> = None;
         loop {
             match command_rx.try_recv() {
                 Ok(DecoderCommand::Seek(time)) => {
-                    let t = time.clamp(0.0, duration);
-                    current_time = t;
-
-                    // Kill existing process, respawn at new position
-                    kill_process(&mut process);
-                    if let Some(mut child) = spawn_ffmpeg(&path, t, width, height, fps) {
-                        // Read one frame for preview
-                        if let Some(frame) = read_one_frame(&mut child, width, height, frame_size, t) {
-                            *current_frame.lock().unwrap() = Some(frame.clone());
-                            let _ = frame_tx.send(frame);
-                        }
-                        // If not playing, kill the process to save resources
-                        if !is_playing {
-                            kill_process(&mut Some(child));
-                        } else {
-                            process = Some(child);
-                        }
-                    }
+                    // Only keep the last seek — avoids spawning FFmpeg for every intermediate position
+                    last_seek = Some(time);
                 }
                 Ok(DecoderCommand::Play) => {
                     is_playing = true;
@@ -235,6 +220,25 @@ fn decoder_thread(
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // Process only the last seek (all intermediate ones are skipped)
+        if let Some(time) = last_seek {
+            let t = time.clamp(0.0, duration);
+            current_time = t;
+
+            kill_process(&mut process);
+            if let Some(mut child) = spawn_ffmpeg(&path, t, width, height, fps) {
+                if let Some(frame) = read_one_frame(&mut child, width, height, frame_size, t) {
+                    *current_frame.lock().unwrap() = Some(frame.clone());
+                    let _ = frame_tx.send(frame);
+                }
+                if !is_playing {
+                    kill_process(&mut Some(child));
+                } else {
+                    process = Some(child);
+                }
             }
         }
 

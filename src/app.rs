@@ -1,5 +1,5 @@
 use crate::export_queue::{JobStatus, SharedQueue, create_shared_queue};
-use crate::ffmpeg::{FFmpegWrapper, SilenceInterval, TaskProgress, compute_cut_points};
+use crate::ffmpeg::{FFmpegWrapper, SilenceInterval, TaskProgress, compute_cut_points, BitrateMap, extract_bitrate_map, compute_cut_points_accurate};
 use crate::player::{MediaPlayer, PlaybackState};
 use crate::project::{MediaFile, Project};
 use crate::ui::{SplitSegment, SplitSettings, TrimMode};
@@ -44,6 +44,10 @@ pub struct FFmpegApp {
     pub auto_cut_running: bool,
     pub auto_cut_status: String,
     auto_cut_silences: Arc<Mutex<Option<Vec<SilenceInterval>>>>,
+    auto_cut_bitrate_map: Arc<Mutex<Option<BitrateMap>>>,
+
+    // Per-file bitrate maps (cached)
+    bitrate_maps: HashMap<PathBuf, BitrateMap>,
 
     // Per-file segments (persisted when switching files)
     pub file_segments: HashMap<PathBuf, Vec<SplitSegment>>,
@@ -58,6 +62,11 @@ pub struct FFmpegApp {
 
     // Merge state
     pub merge_file_order: Vec<usize>,
+
+    // Waveform state
+    pub waveform_peaks: HashMap<PathBuf, Vec<f32>>,
+    pub current_waveform: Vec<f32>,
+    waveform_loading: Arc<Mutex<Option<(PathBuf, Vec<f32>)>>>,
 }
 
 impl FFmpegApp {
@@ -97,6 +106,10 @@ impl FFmpegApp {
             auto_cut_running: false,
             auto_cut_status: String::new(),
             auto_cut_silences: Arc::new(Mutex::new(None)),
+            auto_cut_bitrate_map: Arc::new(Mutex::new(None)),
+
+            // Bitrate maps
+            bitrate_maps: HashMap::new(),
 
             // Per-file segments
             file_segments: HashMap::new(),
@@ -110,6 +123,11 @@ impl FFmpegApp {
 
             // Merge
             merge_file_order: Vec::new(),
+
+            // Waveform
+            waveform_peaks: HashMap::new(),
+            current_waveform: Vec::new(),
+            waveform_loading: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -196,6 +214,20 @@ impl FFmpegApp {
                     // Restore segments from per-file map (or empty)
                     self.segments = self.file_segments.get(&path).cloned().unwrap_or_default();
                     self.selected_segment = if self.segments.is_empty() { None } else { Some(0) };
+
+                    // Load waveform: from cache or start background extraction
+                    if let Some(peaks) = self.waveform_peaks.get(&path) {
+                        self.current_waveform = peaks.clone();
+                    } else {
+                        self.current_waveform.clear();
+                        let slot = self.waveform_loading.clone();
+                        let path_clone = path.clone();
+                        std::thread::spawn(move || {
+                            let peaks = extract_waveform_peaks(&path_clone);
+                            *slot.lock().unwrap() = Some((path_clone, peaks));
+                        });
+                    }
+
                     self.status_message = format!("Loaded: {}", filename);
                 }
                 Err(e) => {
@@ -238,6 +270,8 @@ impl FFmpegApp {
             let clamped_time = time.clamp(0.0, duration);
             player.seek(clamped_time);
             self.current_time = clamped_time;
+            // Reset so the next frame is always uploaded to the texture
+            self.last_frame_pts = -1.0;
         }
     }
 
@@ -336,6 +370,47 @@ impl FFmpegApp {
         }
     }
 
+    /// Split a segment at a given time (e.g. the playhead position).
+    /// Creates two sub-segments from the original one.
+    pub fn split_segment_at(&mut self, index: usize, time: f64) {
+        if index >= self.segments.len() {
+            return;
+        }
+
+        let seg = &self.segments[index];
+        if time <= seg.start_time || time >= seg.end_time {
+            self.status_message = "Playhead must be inside the segment to split".to_string();
+            return;
+        }
+
+        let first_half = SplitSegment::new(seg.start_time, time, String::new());
+        let second_half = SplitSegment::new(time, seg.end_time, String::new());
+
+        // Replace the original segment with two halves
+        self.segments.splice(index..=index, [first_half, second_half]);
+
+        // Re-label all segments and recalculate sizes using real bitrate data
+        for (i, s) in self.segments.iter_mut().enumerate() {
+            s.label = format!("Segment {}", i + 1);
+        }
+        if let Some(file) = self.selected_file() {
+            let path = file.path.clone();
+            let info = file.info.clone();
+            let bmap = self.bitrate_maps.get(&path);
+            for s in &mut self.segments {
+                if let Some(bm) = bmap {
+                    s.estimated_size_bytes = bm.bytes_between(s.start_time, s.end_time);
+                } else {
+                    s.estimated_size_bytes =
+                        crate::utils::estimate_segment_size(&info, s.start_time, s.end_time);
+                }
+            }
+        }
+
+        self.selected_segment = Some(index);
+        self.status_message = format!("Segment split into {} segments", self.segments.len());
+    }
+
     /// Recalculate estimated sizes for all segments
     pub fn recalculate_sizes(&mut self) {
         if let Some(file) = self.selected_file() {
@@ -347,35 +422,98 @@ impl FFmpegApp {
         }
     }
 
-    /// Auto-split a segment that exceeds max_bytes into smaller sub-segments
-    fn auto_split_segment(segment: &SplitSegment, max_bytes: u64, bitrate_bps: f64) -> Vec<SplitSegment> {
-        if max_bytes == 0 || segment.estimated_size_bytes <= max_bytes {
+    /// Auto-split a segment that exceeds max_bytes into smaller sub-segments.
+    /// Uses the bitrate map (cumulative real byte sums) when available,
+    /// falls back to uniform bitrate estimate otherwise.
+    fn auto_split_segment(
+        segment: &SplitSegment,
+        max_bytes: u64,
+        bitrate_bps: f64,
+        bitrate_map: Option<&BitrateMap>,
+    ) -> Vec<SplitSegment> {
+        if max_bytes == 0 {
             return vec![segment.clone()];
         }
 
-        // Calculate max duration per sub-segment
-        let bytes_per_second = bitrate_bps / 8.0;
-        if bytes_per_second <= 0.0 {
+        // Get the real size from the bitrate map if available
+        let real_size = bitrate_map
+            .map(|bm| bm.bytes_between(segment.start_time, segment.end_time))
+            .unwrap_or(segment.estimated_size_bytes);
+
+        if real_size <= max_bytes {
             return vec![segment.clone()];
         }
-        let max_duration = max_bytes as f64 / bytes_per_second;
-        let total_duration = segment.duration();
-        let num_parts = (total_duration / max_duration).ceil() as usize;
 
-        let mut result = Vec::new();
-        for i in 0..num_parts {
-            let start = segment.start_time + i as f64 * max_duration;
-            let end = (segment.start_time + (i + 1) as f64 * max_duration).min(segment.end_time);
-            let mut sub = SplitSegment::new(
-                start,
-                end,
-                format!("{} ({}/{})", segment.label, i + 1, num_parts),
-            );
-            sub.enabled = segment.enabled;
-            sub.estimated_size_bytes = (bytes_per_second * (end - start)) as u64;
-            result.push(sub);
+        let effective_max = (max_bytes as f64 * 0.98) as u64; // 2% safety margin
+
+        if let Some(bm) = bitrate_map {
+            // --- Bitrate-map path: cut by cumulative byte sum ---
+            let mut result = Vec::new();
+            let mut cursor = segment.start_time;
+            let mut part = 1;
+
+            while cursor < segment.end_time - 0.1 {
+                // Walk forward until we've accumulated effective_max bytes
+                let cut = bm.time_for_bytes(cursor, effective_max).min(segment.end_time);
+
+                // Ensure we always advance at least 1 second
+                let cut = if cut <= cursor + 0.5 {
+                    (cursor + 1.0).min(segment.end_time)
+                } else {
+                    cut
+                };
+
+                let end = if segment.end_time - cut < 1.0 { segment.end_time } else { cut };
+
+                let mut sub = SplitSegment::new(
+                    cursor,
+                    end,
+                    format!("{} ({}/...)", segment.label, part),
+                );
+                sub.enabled = segment.enabled;
+                sub.estimated_size_bytes = bm.bytes_between(cursor, end);
+                result.push(sub);
+
+                cursor = end;
+                part += 1;
+
+                if end >= segment.end_time - 0.1 {
+                    break;
+                }
+            }
+
+            // Fix labels now that we know the total part count
+            let total = result.len();
+            for (i, s) in result.iter_mut().enumerate() {
+                s.label = format!("{} ({}/{})", segment.label, i + 1, total);
+            }
+
+            result
+        } else {
+            // --- Fallback: uniform bitrate estimate ---
+            let bytes_per_second = bitrate_bps / 8.0;
+            if bytes_per_second <= 0.0 {
+                return vec![segment.clone()];
+            }
+            let max_duration = effective_max as f64 / bytes_per_second;
+            let total_duration = segment.duration();
+            let num_parts = (total_duration / max_duration).ceil() as usize;
+
+            let mut result = Vec::new();
+            for i in 0..num_parts {
+                let start = segment.start_time + i as f64 * max_duration;
+                let end = (segment.start_time + (i + 1) as f64 * max_duration).min(segment.end_time);
+                let mut sub = SplitSegment::new(
+                    start,
+                    end,
+                    format!("{} ({}/{})", segment.label, i + 1, num_parts),
+                );
+                sub.enabled = segment.enabled;
+                sub.estimated_size_bytes = (bytes_per_second * (end - start)) as u64;
+                result.push(sub);
+            }
+            result
         }
-        result
     }
 
     /// Start automatic silence-aware cutting.
@@ -395,38 +533,56 @@ impl FFmpegApp {
         }
 
         let input_path = file.path.clone();
+        let file_duration = file.info.duration;
         let ffmpeg = self.ffmpeg.clone();
-        let slot = self.auto_cut_silences.clone();
+        let silence_slot = self.auto_cut_silences.clone();
+        let bitrate_slot = self.auto_cut_bitrate_map.clone();
 
-        // Clear previous result
-        *slot.lock().unwrap() = None;
+        // Clear previous results
+        *silence_slot.lock().unwrap() = None;
+        *bitrate_slot.lock().unwrap() = None;
         self.auto_cut_running = true;
-        self.auto_cut_status = "Detecting silence...".to_string();
-        self.status_message = "Auto-Cut: detecting silence...".to_string();
+        self.auto_cut_status = "Analyzing (silence + bitrate)...".to_string();
+        self.status_message = "Auto-Cut: analyzing...".to_string();
 
+        // Silence detection (async via tokio)
+        let input_path_clone = input_path.clone();
         self.runtime.spawn(async move {
-            let result = ffmpeg.detect_silence(&input_path, -30.0, 0.3).await;
+            let result = ffmpeg.detect_silence(&input_path_clone, -30.0, 0.3).await;
             let silences = result.unwrap_or_default();
-            *slot.lock().unwrap() = Some(silences);
+            *silence_slot.lock().unwrap() = Some(silences);
+        });
+
+        // Bitrate map extraction (blocking, in a separate thread)
+        std::thread::spawn(move || {
+            let bmap = extract_bitrate_map(&input_path, file_duration);
+            *bitrate_slot.lock().unwrap() = Some(bmap);
         });
     }
 
-    /// Called every frame to check if silence detection finished and compute segments.
+    /// Called every frame to check if silence detection + bitrate map finished,
+    /// then compute segments using accurate bitrate data.
     pub fn poll_auto_cut(&mut self) {
         if !self.auto_cut_running {
             return;
         }
 
-        // Check if the async task wrote its result
-        let silences = {
-            let mut slot = self.auto_cut_silences.lock().unwrap();
-            slot.take()
-        };
+        // Both silence detection and bitrate map must be ready
+        let silences_ready = self.auto_cut_silences.lock().unwrap().is_some();
+        let bitrate_ready = self.auto_cut_bitrate_map.lock().unwrap().is_some();
 
-        let silences = match silences {
-            Some(s) => s,
-            None => return, // still running
-        };
+        if !silences_ready || !bitrate_ready {
+            // Update status
+            if silences_ready {
+                self.auto_cut_status = "Analyzing bitrate...".to_string();
+            } else if bitrate_ready {
+                self.auto_cut_status = "Detecting silence...".to_string();
+            }
+            return;
+        }
+
+        let silences = self.auto_cut_silences.lock().unwrap().take().unwrap();
+        let bitrate_map = self.auto_cut_bitrate_map.lock().unwrap().take().unwrap();
 
         // Detection is done
         self.auto_cut_running = false;
@@ -441,18 +597,29 @@ impl FFmpegApp {
             }
         };
 
-        let total_bitrate_bps = Self::compute_bitrate(&info);
         let max_bytes = (self.split_settings.max_size_mb * 1024.0 * 1024.0) as u64;
 
-        let cut_points = compute_cut_points(
-            info.duration,
-            total_bitrate_bps,
-            max_bytes,
-            30.0,
-            &silences,
-        );
+        // Use accurate bitrate-aware cutting if we got data, fallback to uniform
+        let cut_points = if !bitrate_map.is_empty() {
+            compute_cut_points_accurate(
+                info.duration,
+                max_bytes,
+                30.0,
+                &silences,
+                &bitrate_map,
+            )
+        } else {
+            let total_bitrate_bps = Self::compute_bitrate(&info);
+            compute_cut_points(
+                info.duration,
+                total_bitrate_bps,
+                max_bytes,
+                30.0,
+                &silences,
+            )
+        };
 
-        // Replace segments
+        // Replace segments with accurate size estimates
         self.segments.clear();
         for (i, (start, end)) in cut_points.iter().enumerate() {
             let mut seg = SplitSegment::new(
@@ -460,8 +627,13 @@ impl FFmpegApp {
                 *end,
                 format!("Segment {}", i + 1),
             );
-            seg.estimated_size_bytes =
-                crate::utils::estimate_segment_size(&info, *start, *end);
+            // Use bitrate map for accurate size if available
+            if !bitrate_map.is_empty() {
+                seg.estimated_size_bytes = bitrate_map.bytes_between(*start, *end);
+            } else {
+                seg.estimated_size_bytes =
+                    crate::utils::estimate_segment_size(&info, *start, *end);
+            }
             self.segments.push(seg);
         }
 
@@ -471,19 +643,28 @@ impl FFmpegApp {
             Some(0)
         };
 
-        let silence_info = if silences.is_empty() {
-            "no silence detected, uniform split"
+        let method_info = if !bitrate_map.is_empty() {
+            "bitrate-aware"
         } else {
-            "silence-aware split"
+            "uniform estimate"
         };
+        let silence_info = if silences.is_empty() {
+            "no silence detected"
+        } else {
+            "silence-aware"
+        };
+
+        // Cache the bitrate map
+        self.bitrate_maps.insert(file_path.clone(), bitrate_map);
 
         // Save to per-file map
         self.file_segments.insert(file_path, self.segments.clone());
 
         self.auto_cut_status = format!(
-            "Auto-Cut: {} segment(s) ({})",
+            "Auto-Cut: {} segment(s) ({}, {})",
             self.segments.len(),
-            silence_info
+            silence_info,
+            method_info,
         );
         self.status_message = self.auto_cut_status.clone();
     }
@@ -504,6 +685,88 @@ impl FFmpegApp {
             if let Some(segs) = self.file_segments.get(&file.path) {
                 self.segments = segs.clone();
                 self.selected_segment = if self.segments.is_empty() { None } else { Some(0) };
+            }
+        }
+    }
+
+    /// Remove a specific file by index
+    pub fn remove_file_at(&mut self, index: usize) {
+        if index >= self.project.files.len() {
+            return;
+        }
+
+        let path = self.project.files[index].path.clone();
+        self.file_segments.remove(&path);
+        self.waveform_peaks.remove(&path);
+        self.bitrate_maps.remove(&path);
+
+        // If removing the currently selected file, stop player
+        if self.selected_file_index == Some(index) {
+            self.stop_player();
+            self.player = None;
+            self.segments.clear();
+            self.selected_segment = None;
+            self.current_waveform.clear();
+            self.preview_texture = None;
+        }
+
+        self.project.files.remove(index);
+
+        // Adjust selected index
+        if self.project.files.is_empty() {
+            self.selected_file_index = None;
+        } else if let Some(sel) = self.selected_file_index {
+            if sel >= self.project.files.len() {
+                self.selected_file_index = Some(self.project.files.len() - 1);
+            } else if index < sel {
+                self.selected_file_index = Some(sel - 1);
+            }
+        }
+
+        // Reload player if needed
+        if self.selected_file_index.is_some() && self.player.is_none() {
+            self.load_player_for_selected_file();
+        }
+
+        self.sync_merge_order();
+        self.status_message = format!("{} file(s) loaded", self.project.files.len());
+    }
+
+    /// Remove all imported files
+    pub fn remove_all_files(&mut self) {
+        self.stop_player();
+        self.player = None;
+        self.project.files.clear();
+        self.segments.clear();
+        self.selected_segment = None;
+        self.selected_file_index = None;
+        self.file_segments.clear();
+        self.waveform_peaks.clear();
+        self.current_waveform.clear();
+        self.bitrate_maps.clear();
+        self.preview_texture = None;
+        self.merge_file_order.clear();
+        self.in_point = None;
+        self.out_point = None;
+        self.current_time = 0.0;
+        self.last_frame_pts = -1.0;
+        self.status_message = "All files removed".to_string();
+    }
+
+    /// Poll waveform extraction results (called each frame)
+    pub fn poll_waveform(&mut self) {
+        let result = {
+            let mut slot = self.waveform_loading.lock().unwrap();
+            slot.take()
+        };
+
+        if let Some((path, peaks)) = result {
+            self.waveform_peaks.insert(path.clone(), peaks.clone());
+            // If this is the currently selected file, update current_waveform
+            if let Some(file) = self.selected_file() {
+                if file.path == path {
+                    self.current_waveform = peaks;
+                }
             }
         }
     }
@@ -659,6 +922,7 @@ impl FFmpegApp {
             let ext = file.path.extension().unwrap_or_default().to_string_lossy().to_string();
             let info = &file.info;
             let bitrate_bps = Self::compute_bitrate(info);
+            let bmap = self.bitrate_maps.get(&file.path);
 
             // Per-file subfolder
             let subfolder = output_base.join(&stem);
@@ -667,11 +931,11 @@ impl FFmpegApp {
                 return;
             }
 
-            // Build final segments (with auto-split safety net)
+            // Build final segments (with auto-split safety net using real bitrate sums)
             let mut final_segments = Vec::new();
             for seg in &enabled {
                 if max_size_bytes > 0 {
-                    final_segments.extend(Self::auto_split_segment(seg, max_size_bytes, bitrate_bps));
+                    final_segments.extend(Self::auto_split_segment(seg, max_size_bytes, bitrate_bps, bmap));
                 } else {
                     final_segments.push(seg.clone());
                 }
@@ -840,11 +1104,12 @@ impl FFmpegApp {
             }
         };
 
-        // Build final segment list (with auto-split if needed)
+        // Build final segment list (with auto-split using real bitrate sums)
+        let bmap = self.bitrate_maps.get(&input_path);
         let mut final_segments = Vec::new();
         for seg in &enabled_segments {
             if max_size_bytes > 0 {
-                final_segments.extend(Self::auto_split_segment(seg, max_size_bytes, total_bitrate_bps));
+                final_segments.extend(Self::auto_split_segment(seg, max_size_bytes, total_bitrate_bps, bmap));
             } else {
                 final_segments.push(seg.clone());
             }
@@ -1137,6 +1402,9 @@ impl eframe::App for FFmpegApp {
         // Poll batch processing
         self.poll_batch();
 
+        // Poll waveform extraction
+        self.poll_waveform();
+
         // Render UI
         crate::ui::render_main_window(self, ctx);
 
@@ -1195,4 +1463,34 @@ impl eframe::App for FFmpegApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// Extract audio waveform peaks using FFmpeg at 1kHz sample rate.
+/// Returns absolute amplitude values (one per millisecond).
+fn extract_waveform_peaks(path: &PathBuf) -> Vec<f32> {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.arg("-i")
+        .arg(path)
+        .args(["-ac", "1", "-ar", "1000", "-f", "f32le", "-vn", "pipe:1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    // Convert raw f32le bytes to absolute float samples
+    output.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs())
+        .collect()
 }

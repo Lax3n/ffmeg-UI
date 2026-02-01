@@ -1,4 +1,7 @@
-/// Silence detection and intelligent cut-point computation.
+/// Silence detection, bitrate mapping, and intelligent cut-point computation.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 /// A detected silence interval from FFmpeg's silencedetect filter.
 #[derive(Debug, Clone)]
@@ -134,6 +137,233 @@ pub fn compute_cut_points(
             }
         } else {
             ideal_end
+        };
+
+        segments.push((cursor, cut_point));
+        cursor = cut_point;
+    }
+
+    segments
+}
+
+/// Cumulative byte size at each second boundary.
+/// `cumulative_bytes[i]` = total bytes from time 0 to second `i`.
+#[derive(Debug, Clone)]
+pub struct BitrateMap {
+    /// cumulative_bytes[i] = bytes from start to second i
+    pub cumulative_bytes: Vec<u64>,
+    pub duration: f64,
+}
+
+impl BitrateMap {
+    /// Get the estimated byte count between two timestamps.
+    pub fn bytes_between(&self, start: f64, end: f64) -> u64 {
+        let start_sec = (start.floor() as usize).min(self.cumulative_bytes.len().saturating_sub(1));
+        let end_sec = (end.ceil() as usize).min(self.cumulative_bytes.len().saturating_sub(1));
+        self.cumulative_bytes[end_sec].saturating_sub(self.cumulative_bytes[start_sec])
+    }
+
+    /// Find the time at which `target_bytes` bytes have been consumed since `start_time`.
+    /// Returns the second boundary where the cumulative size first exceeds start + target_bytes.
+    pub fn time_for_bytes(&self, start_time: f64, target_bytes: u64) -> f64 {
+        let start_sec = (start_time.floor() as usize).min(self.cumulative_bytes.len().saturating_sub(1));
+        let base_bytes = self.cumulative_bytes[start_sec];
+
+        for i in (start_sec + 1)..self.cumulative_bytes.len() {
+            if self.cumulative_bytes[i] - base_bytes >= target_bytes {
+                return i as f64;
+            }
+        }
+
+        self.duration
+    }
+
+    /// Check if empty / failed to extract.
+    pub fn is_empty(&self) -> bool {
+        self.cumulative_bytes.is_empty()
+    }
+}
+
+/// Extract a bitrate map from a video using ffprobe packet sizes.
+/// Groups packet sizes by second to build a cumulative byte curve.
+/// This gives accurate size data even for variable bitrate content.
+pub fn extract_bitrate_map(path: &Path, duration: f64) -> BitrateMap {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v", "quiet",
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,size",
+        "-of", "csv=p=0",
+    ])
+    .arg(path)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .stdin(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return BitrateMap { cumulative_bytes: Vec::new(), duration },
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let num_seconds = (duration.ceil() as usize) + 1;
+    let mut bytes_per_second = vec![0u64; num_seconds];
+
+    // Parse lines like "1.234,5678" (pts_time,size)
+    for line in stdout.lines() {
+        let mut parts = line.split(',');
+        let time_str = match parts.next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        let size_str = match parts.next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+
+        let time: f64 = match time_str.parse() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let size: u64 = match size_str.parse() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let sec = (time.floor() as usize).min(num_seconds.saturating_sub(1));
+        bytes_per_second[sec] += size;
+    }
+
+    // Also account for audio stream sizes
+    let mut cmd_audio = Command::new("ffprobe");
+    cmd_audio.args([
+        "-v", "quiet",
+        "-select_streams", "a:0",
+        "-show_entries", "packet=pts_time,size",
+        "-of", "csv=p=0",
+    ])
+    .arg(path)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .stdin(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd_audio.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    if let Ok(audio_output) = cmd_audio.output() {
+        let audio_stdout = String::from_utf8_lossy(&audio_output.stdout);
+        for line in audio_stdout.lines() {
+            let mut parts = line.split(',');
+            let time_str = match parts.next() {
+                Some(s) => s.trim(),
+                None => continue,
+            };
+            let size_str = match parts.next() {
+                Some(s) => s.trim(),
+                None => continue,
+            };
+            let time: f64 = match time_str.parse() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let size: u64 = match size_str.parse() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let sec = (time.floor() as usize).min(num_seconds.saturating_sub(1));
+            bytes_per_second[sec] += size;
+        }
+    }
+
+    // Build cumulative array
+    let mut cumulative = vec![0u64; num_seconds];
+    for i in 1..num_seconds {
+        cumulative[i] = cumulative[i - 1] + bytes_per_second[i - 1];
+    }
+
+    BitrateMap {
+        cumulative_bytes: cumulative,
+        duration,
+    }
+}
+
+/// Compute cut points using actual per-second bitrate data (BitrateMap)
+/// instead of an average bitrate estimate. Handles variable bitrate content.
+pub fn compute_cut_points_accurate(
+    duration: f64,
+    max_bytes: u64,
+    tolerance_secs: f64,
+    silences: &[SilenceInterval],
+    bitrate_map: &BitrateMap,
+) -> Vec<(f64, f64)> {
+    if duration <= 0.0 || max_bytes == 0 || bitrate_map.is_empty() {
+        return vec![(0.0, duration.max(0.0))];
+    }
+
+    // Apply 2% safety margin
+    let effective_max_bytes = (max_bytes as f64 * 0.98) as u64;
+
+    // If the whole file fits in one segment
+    let total_bytes = bitrate_map.bytes_between(0.0, duration);
+    if total_bytes <= effective_max_bytes {
+        return vec![(0.0, duration)];
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0.0;
+
+    while cursor < duration - 0.1 {
+        // Find where the cumulative size from cursor reaches effective_max_bytes
+        let ideal_end = bitrate_map.time_for_bytes(cursor, effective_max_bytes).min(duration);
+
+        // If this chunk reaches the end, just take it
+        if ideal_end >= duration - 0.1 {
+            segments.push((cursor, duration));
+            break;
+        }
+
+        // Search for the best silence to cut at within ±tolerance of ideal_end
+        let window_start = (ideal_end - tolerance_secs).max(cursor + 1.0);
+        let window_end = (ideal_end + tolerance_secs).min(duration);
+
+        let best_silence = silences
+            .iter()
+            .filter(|s| s.midpoint() >= window_start && s.midpoint() <= window_end)
+            .min_by(|a, b| {
+                let dist_a = (a.midpoint() - ideal_end).abs();
+                let dist_b = (b.midpoint() - ideal_end).abs();
+                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        let cut_point = if let Some(silence) = best_silence {
+            let mid = silence.midpoint();
+            // Verify that cutting here doesn't exceed max bytes
+            let bytes = bitrate_map.bytes_between(cursor, mid);
+            if bytes <= effective_max_bytes {
+                mid
+            } else {
+                ideal_end
+            }
+        } else {
+            ideal_end
+        };
+
+        // Safety: ensure we advance at least 1 second
+        let cut_point = if cut_point <= cursor + 0.5 {
+            (cursor + 1.0).min(duration)
+        } else {
+            cut_point
         };
 
         segments.push((cursor, cut_point));
