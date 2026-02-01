@@ -1,7 +1,7 @@
-//! Persistent FFmpeg decoder that streams frames continuously
-//! Much faster than spawning a new process for each frame
+//! Persistent FFmpeg decoder that streams frames continuously via stdout pipe.
+//! One FFmpeg process runs at a time; on seek we kill+respawn at the new position.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -38,11 +38,10 @@ impl StreamDecoder {
         let current_frame = Arc::new(Mutex::new(None));
         let is_running = Arc::new(Mutex::new(true));
 
-        // Preview at 480p max for performance
-        let preview_width = width.min(854);
-        let preview_height = height.min(480);
+        // Preview at 640x360 max for performance
+        let preview_width = width.min(640);
+        let preview_height = height.min(360);
 
-        // Start decoder thread
         let path_clone = path.clone();
         let current_frame_clone = current_frame.clone();
         let is_running_clone = is_running.clone();
@@ -87,7 +86,7 @@ impl StreamDecoder {
 
     /// Get the current frame
     pub fn get_frame(&self) -> Option<VideoFrame> {
-        // Try to get latest frame from channel
+        // Drain all available frames, keep the latest
         if let Ok(rx) = self.frame_rx.lock() {
             while let Ok(frame) = rx.try_recv() {
                 *self.current_frame.lock().unwrap() = Some(frame);
@@ -109,96 +108,169 @@ impl Drop for StreamDecoder {
     }
 }
 
-/// The decoder thread that manages the FFmpeg process
+// ---- Internal helpers ----
+
+/// Spawn a persistent FFmpeg process that outputs raw RGBA frames to stdout
+fn spawn_ffmpeg(path: &PathBuf, start_time: f64, width: u32, height: u32, fps: u32) -> Option<Child> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-ss", &format!("{:.3}", start_time),
+        "-i",
+    ])
+    .arg(path)
+    .args([
+        "-vf", &format!("scale={}:{},fps={}", width, height, fps),
+        "-f", "rawvideo",
+        "-pix_fmt", "rgba",
+        "pipe:1",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .stdin(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn().ok()
+}
+
+/// Kill a process cleanly (kill + wait to avoid zombies)
+fn kill_process(proc: &mut Option<Child>) {
+    if let Some(ref mut child) = proc {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *proc = None;
+}
+
+/// Read exactly one frame (width*height*4 bytes) from the process stdout.
+/// Handles partial reads by looping until the buffer is full.
+fn read_one_frame(
+    proc: &mut Child,
+    width: u32,
+    height: u32,
+    frame_size: usize,
+    pts: f64,
+) -> Option<VideoFrame> {
+    let stdout = proc.stdout.as_mut()?;
+    let mut buf = vec![0u8; frame_size];
+    let mut offset = 0;
+
+    while offset < frame_size {
+        match stdout.read(&mut buf[offset..]) {
+            Ok(0) => return None, // EOF — process ended
+            Ok(n) => offset += n,
+            Err(_) => return None,
+        }
+    }
+
+    Some(VideoFrame {
+        data: Arc::new(buf),
+        width,
+        height,
+        pts,
+    })
+}
+
+/// The decoder thread — runs a persistent FFmpeg process
 fn decoder_thread(
     path: PathBuf,
     width: u32,
     height: u32,
-    _duration: f64,
+    duration: f64,
     command_rx: Receiver<DecoderCommand>,
     frame_tx: Sender<VideoFrame>,
     current_frame: Arc<Mutex<Option<VideoFrame>>>,
     is_running: Arc<Mutex<bool>>,
 ) {
     let frame_size = (width * height * 4) as usize;
-    let mut current_time = 0.0;
+    let fps: u32 = 15;
+    let mut current_time: f64 = 0.0;
     let mut is_playing = false;
+    let mut process: Option<Child> = None;
 
     loop {
-        // Check for commands (non-blocking)
-        match command_rx.try_recv() {
-            Ok(DecoderCommand::Seek(time)) => {
-                current_time = time;
-                // Extract frame at seek position
-                if let Ok(frame) = extract_single_frame(&path, time, width, height, frame_size) {
-                    *current_frame.lock().unwrap() = Some(frame.clone());
-                    let _ = frame_tx.send(frame);
+        // Drain all pending commands (non-blocking)
+        loop {
+            match command_rx.try_recv() {
+                Ok(DecoderCommand::Seek(time)) => {
+                    let t = time.clamp(0.0, duration);
+                    current_time = t;
+
+                    // Kill existing process, respawn at new position
+                    kill_process(&mut process);
+                    if let Some(mut child) = spawn_ffmpeg(&path, t, width, height, fps) {
+                        // Read one frame for preview
+                        if let Some(frame) = read_one_frame(&mut child, width, height, frame_size, t) {
+                            *current_frame.lock().unwrap() = Some(frame.clone());
+                            let _ = frame_tx.send(frame);
+                        }
+                        // If not playing, kill the process to save resources
+                        if !is_playing {
+                            kill_process(&mut Some(child));
+                        } else {
+                            process = Some(child);
+                        }
+                    }
                 }
+                Ok(DecoderCommand::Play) => {
+                    is_playing = true;
+                }
+                Ok(DecoderCommand::Pause) => {
+                    is_playing = false;
+                    kill_process(&mut process);
+                }
+                Ok(DecoderCommand::Stop) => {
+                    kill_process(&mut process);
+                    *is_running.lock().unwrap() = false;
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    kill_process(&mut process);
+                    *is_running.lock().unwrap() = false;
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
             }
-            Ok(DecoderCommand::Play) => {
-                is_playing = true;
+        }
+
+        if is_playing {
+            // Spawn process if needed
+            if process.is_none() {
+                process = spawn_ffmpeg(&path, current_time, width, height, fps);
             }
-            Ok(DecoderCommand::Pause) => {
+
+            if let Some(ref mut child) = process {
+                // Read the next frame — FFmpeg's fps filter does rate limiting
+                match read_one_frame(child, width, height, frame_size, current_time) {
+                    Some(frame) => {
+                        *current_frame.lock().unwrap() = Some(frame.clone());
+                        let _ = frame_tx.send(frame);
+                        current_time += 1.0 / fps as f64;
+
+                        // End of video
+                        if current_time >= duration {
+                            is_playing = false;
+                            kill_process(&mut process);
+                        }
+                    }
+                    None => {
+                        // EOF or error — stop playback
+                        is_playing = false;
+                        kill_process(&mut process);
+                    }
+                }
+            } else {
+                // Failed to spawn — stop
                 is_playing = false;
             }
-            Ok(DecoderCommand::Stop) => {
-                *is_running.lock().unwrap() = false;
-                break;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-
-        // If playing, extract next frame
-        if is_playing {
-            if let Ok(frame) = extract_single_frame(&path, current_time, width, height, frame_size) {
-                *current_frame.lock().unwrap() = Some(frame.clone());
-                let _ = frame_tx.send(frame);
-                current_time += 0.1; // Advance time
-            }
-            thread::sleep(std::time::Duration::from_millis(80)); // ~12 fps
         } else {
-            thread::sleep(std::time::Duration::from_millis(16)); // Check commands at 60fps
+            // Idle — sleep briefly and check commands
+            thread::sleep(std::time::Duration::from_millis(16));
         }
     }
-}
-
-/// Extract a single frame using FFmpeg with rawvideo pipe
-fn extract_single_frame(
-    path: &PathBuf,
-    time: f64,
-    width: u32,
-    height: u32,
-    expected_size: usize,
-) -> Result<VideoFrame, String> {
-    let output = Command::new("ffmpeg")
-        .args([
-            "-ss", &format!("{:.3}", time),
-            "-i",
-        ])
-        .arg(path)
-        .args([
-            "-vframes", "1",
-            "-vf", &format!("scale={}:{}", width, height),
-            "-f", "rawvideo",
-            "-pix_fmt", "rgba",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if output.stdout.len() != expected_size {
-        return Err("Invalid frame size".to_string());
-    }
-
-    Ok(VideoFrame {
-        data: output.stdout,
-        width,
-        height,
-        pts: time,
-    })
 }

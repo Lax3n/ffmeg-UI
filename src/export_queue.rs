@@ -19,6 +19,9 @@ pub enum ExportOperation {
         end: f64,
         mode: TrimMode,
     },
+    Concat {
+        inputs: Vec<PathBuf>,
+    },
 }
 
 /// A single export job
@@ -30,6 +33,7 @@ pub struct ExportJob {
     pub operation: ExportOperation,
     pub status: JobStatus,
     pub progress: f32,
+    pub segment_label: String,
 }
 
 impl ExportJob {
@@ -41,6 +45,19 @@ impl ExportJob {
             operation: ExportOperation::Trim { start, end, mode },
             status: JobStatus::Pending,
             progress: 0.0,
+            segment_label: String::new(),
+        }
+    }
+
+    pub fn new_trim_with_label(id: u32, input: PathBuf, output: PathBuf, start: f64, end: f64, mode: TrimMode, label: String) -> Self {
+        Self {
+            id,
+            input,
+            output,
+            operation: ExportOperation::Trim { start, end, mode },
+            status: JobStatus::Pending,
+            progress: 0.0,
+            segment_label: label,
         }
     }
 
@@ -48,12 +65,25 @@ impl ExportJob {
         match &self.operation {
             ExportOperation::Trim { start, end, mode } => {
                 let duration = end - start;
+                let label_part = if self.segment_label.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}] ", self.segment_label)
+                };
                 format!(
-                    "{} -> {} ({:.1}s, {})",
+                    "{}{} -> {} ({:.1}s, {})",
+                    label_part,
                     self.input.file_name().unwrap_or_default().to_string_lossy(),
                     self.output.file_name().unwrap_or_default().to_string_lossy(),
                     duration,
                     mode.name()
+                )
+            }
+            ExportOperation::Concat { inputs } => {
+                format!(
+                    "Merge {} files -> {}",
+                    inputs.len(),
+                    self.output.file_name().unwrap_or_default().to_string_lossy(),
                 )
             }
         }
@@ -96,6 +126,35 @@ impl ExportQueue {
         id
     }
 
+    /// Add a concat job to the queue
+    pub fn add_concat(&mut self, inputs: Vec<PathBuf>, output: PathBuf, label: String) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let first_input = inputs.first().cloned().unwrap_or_default();
+        let job = ExportJob {
+            id,
+            input: first_input,
+            output,
+            operation: ExportOperation::Concat { inputs },
+            status: JobStatus::Pending,
+            progress: 0.0,
+            segment_label: label,
+        };
+        self.jobs.push(job);
+        id
+    }
+
+    /// Add a trim job with a segment label
+    pub fn add_trim_with_label(&mut self, input: PathBuf, output: PathBuf, start: f64, end: f64, mode: TrimMode, label: String) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let job = ExportJob::new_trim_with_label(id, input, output, start, end, mode, label);
+        self.jobs.push(job);
+        id
+    }
+
     /// Get the next pending job
     pub fn next_pending(&mut self) -> Option<&mut ExportJob> {
         self.jobs.iter_mut().find(|j| j.status == JobStatus::Pending)
@@ -109,6 +168,15 @@ impl ExportQueue {
     /// Get mutable job by ID
     pub fn get_job_mut(&mut self, id: u32) -> Option<&mut ExportJob> {
         self.jobs.iter_mut().find(|j| j.id == id)
+    }
+
+    /// Cancel all pending jobs (running job will finish on its own)
+    pub fn cancel_all(&mut self) {
+        for job in &mut self.jobs {
+            if job.status == JobStatus::Pending {
+                job.status = JobStatus::Failed("Cancelled".to_string());
+            }
+        }
     }
 
     /// Remove completed/failed jobs
@@ -134,6 +202,15 @@ impl ExportQueue {
     /// Check if queue has pending work
     pub fn has_pending(&self) -> bool {
         self.jobs.iter().any(|j| j.status == JobStatus::Pending)
+    }
+
+    /// Total progress: (completed, total)
+    pub fn total_progress(&self) -> (usize, usize) {
+        let total = self.jobs.len();
+        let completed = self.jobs.iter().filter(|j| {
+            matches!(j.status, JobStatus::Completed | JobStatus::Failed(_))
+        }).count();
+        (completed, total)
     }
 }
 

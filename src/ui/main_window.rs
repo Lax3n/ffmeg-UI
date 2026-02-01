@@ -1,8 +1,7 @@
 use crate::app::FFmpegApp;
 use crate::player::PlaybackState;
-use crate::project::{ExportPreset, SUPPORTED_AUDIO_FORMATS, SUPPORTED_VIDEO_FORMATS};
-use crate::ui::{ActiveTool, CropPreset, TimelineWidget, TrimMode};
-use crate::utils::format_time;
+use crate::ui::{TimelineWidget, TrimMode};
+use crate::utils::{format_time, format_size};
 use eframe::egui;
 
 pub fn render_main_window(app: &mut FFmpegApp, ctx: &egui::Context) {
@@ -16,7 +15,12 @@ pub fn render_main_window(app: &mut FFmpegApp, ctx: &egui::Context) {
         render_status_bar(app, ui);
     });
 
-    // Timeline at bottom (above status bar)
+    // Export bar (above status bar)
+    egui::TopBottomPanel::bottom("export_bar").show(ctx, |ui| {
+        render_export_bar(app, ui);
+    });
+
+    // Timeline (above export bar)
     egui::TopBottomPanel::bottom("timeline_panel")
         .resizable(true)
         .min_height(100.0)
@@ -25,77 +29,37 @@ pub fn render_main_window(app: &mut FFmpegApp, ctx: &egui::Context) {
             render_timeline_panel(app, ui);
         });
 
-    // Left panel - File browser
-    egui::SidePanel::left("file_panel")
-        .default_width(250.0)
-        .min_width(200.0)
-        .show(ctx, |ui| {
-            render_file_panel(app, ui);
-        });
-
-    // Right panel - Export queue (when visible)
-    if app.show_queue_panel {
-        egui::SidePanel::right("queue_panel")
-            .default_width(300.0)
-            .min_width(200.0)
-            .show(ctx, |ui| {
-                render_queue_panel(app, ui);
-            });
-    }
-
-    // Central panel
+    // Central panel: preview + controls + segments/settings
     egui::CentralPanel::default().show(ctx, |ui| {
-        // Preview area
+        // Preview area (top ~40%)
         render_preview_area(app, ui);
 
         ui.separator();
 
-        // Playback controls
+        // Playback controls + I/O buttons
         render_playback_controls(app, ui);
 
         ui.separator();
 
-        // Tool tabs
-        ui.horizontal(|ui| {
-            for tool in ActiveTool::all() {
-                if ui
-                    .selectable_label(app.active_tool == *tool, tool.name())
-                    .clicked()
-                {
-                    app.active_tool = *tool;
-                }
-            }
+        // Bottom section: segment list + settings side by side
+        ui.columns(2, |columns| {
+            render_segment_list(app, &mut columns[0]);
+            render_split_settings(app, &mut columns[1]);
         });
-
-        ui.separator();
-
-        // Tool panel
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                render_tool_panel(app, ui);
-            });
     });
 }
 
 fn render_menu_bar(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     egui::menu::bar(ui, |ui| {
         ui.menu_button("File", |ui| {
-            if ui.button("Open Files...").clicked() {
+            if ui.button("Open Video... (Ctrl+O)").clicked() {
                 if let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
-                    .add_filter("Audio", &["mp3", "wav", "aac", "flac", "ogg"])
+                    .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm", "ts", "flv"])
                     .add_filter("All Files", &["*"])
                     .pick_files()
                 {
                     app.add_files(paths);
                 }
-                ui.close_menu();
-            }
-            if ui.button("Clear All").clicked() {
-                app.project.clear();
-                app.selected_file_index = None;
-                app.player = None;
                 ui.close_menu();
             }
             ui.separator();
@@ -122,6 +86,10 @@ fn render_menu_bar(app: &mut FFmpegApp, ui: &mut egui::Ui) {
                 app.set_out_point();
                 ui.close_menu();
             }
+            if ui.button("Add Segment (S)").clicked() {
+                app.add_segment();
+                ui.close_menu();
+            }
             if ui.button("Clear In/Out Points").clicked() {
                 app.clear_in_out_points();
                 ui.close_menu();
@@ -132,34 +100,21 @@ fn render_menu_bar(app: &mut FFmpegApp, ui: &mut egui::Ui) {
             let has_file = app.selected_file().is_some();
 
             if ui.add_enabled(has_file, egui::Button::new("Open in LosslessCut"))
-                .on_hover_text("Open in LosslessCut for precise cutting")
                 .clicked()
             {
                 app.open_in_losslesscut();
                 ui.close_menu();
             }
             if ui.add_enabled(has_file, egui::Button::new("Open in mpv"))
-                .on_hover_text("Open in mpv for smooth preview")
                 .clicked()
             {
                 app.open_in_mpv();
                 ui.close_menu();
             }
             if ui.add_enabled(has_file, egui::Button::new("Open in Default Player"))
-                .on_hover_text("Open with system default application")
                 .clicked()
             {
                 app.open_in_default_player();
-                ui.close_menu();
-            }
-        });
-
-        ui.menu_button("Help", |ui| {
-            if ui.button("Keyboard Shortcuts").clicked() {
-                // TODO: Show shortcuts dialog
-                ui.close_menu();
-            }
-            if ui.button("About").clicked() {
                 ui.close_menu();
             }
         });
@@ -171,129 +126,27 @@ fn render_status_bar(app: &FFmpegApp, ui: &mut egui::Ui) {
         ui.label(&app.status_message);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Ok(progress) = app.current_task.lock() {
-                if let Some(ref p) = *progress {
-                    if !p.is_complete {
-                        ui.add(egui::ProgressBar::new(p.progress).show_percentage());
-                    }
-                }
-            }
-
-            ui.label(format!("{} files", app.project.files.len()));
+            let seg_count = app.segments.len();
+            let file_count = app.project.files.len();
+            ui.label(format!("{} segment(s)", seg_count));
+            ui.separator();
+            ui.label(format!("{} video(s)", file_count));
         });
     });
 }
 
-fn render_file_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Source Files");
-
-    if ui.button("+ Add Files").clicked() {
-        if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
-            .add_filter("Audio", &["mp3", "wav", "aac", "flac", "ogg"])
-            .add_filter("All Files", &["*"])
-            .pick_files()
-        {
-            app.add_files(paths);
-        }
-    }
-
-    ui.separator();
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .max_height(200.0)
-        .show(ui, |ui| {
-            let mut to_select: Option<usize> = None;
-
-            for (i, file) in app.project.files.iter().enumerate() {
-                let is_selected = app.selected_file_index == Some(i);
-                let response = ui.selectable_label(is_selected, file.filename());
-
-                if response.clicked() {
-                    to_select = Some(i);
-                }
-
-                if response.hovered() {
-                    egui::show_tooltip(ui.ctx(), ui.layer_id(), egui::Id::new(format!("file_tooltip_{}", i)), |ui| {
-                        ui.label(format!("Duration: {}", file.duration_string()));
-                        ui.label(format!("Resolution: {}", file.resolution_string()));
-                        if let Some(ref codec) = file.info.video_codec {
-                            ui.label(format!("Video: {}", codec));
-                        }
-                        if let Some(ref codec) = file.info.audio_codec {
-                            ui.label(format!("Audio: {}", codec));
-                        }
-                    });
-                }
-            }
-
-            if let Some(idx) = to_select {
-                app.select_file(idx);
-            }
-        });
-
-    ui.separator();
-
-    // File properties panel
-    if let Some(file) = app.selected_file() {
-        ui.heading("Properties");
-        egui::Grid::new("file_properties").show(ui, |ui| {
-            ui.label("Duration:");
-            ui.label(file.duration_string());
-            ui.end_row();
-
-            ui.label("Resolution:");
-            ui.label(file.resolution_string());
-            ui.end_row();
-
-            if let Some(ref codec) = file.info.video_codec {
-                ui.label("Video Codec:");
-                ui.label(codec);
-                ui.end_row();
-            }
-
-            if let Some(ref codec) = file.info.audio_codec {
-                ui.label("Audio Codec:");
-                ui.label(codec);
-                ui.end_row();
-            }
-
-            if let Some(fps) = file.info.framerate {
-                ui.label("Frame Rate:");
-                ui.label(format!("{:.2} fps", fps));
-                ui.end_row();
-            }
-
-            ui.label("Size:");
-            ui.label(crate::utils::format_size(file.info.file_size));
-            ui.end_row();
-        });
-
-        ui.separator();
-
-        if ui.button("Remove File").clicked() {
-            app.remove_selected_file();
-        }
-    }
-}
-
 fn render_preview_area(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Preview");
-
     let available_size = ui.available_size();
-    let preview_height = (available_size.y * 0.5).min(400.0).max(200.0);
+    let preview_height = (available_size.y * 0.45).min(400.0).max(150.0);
 
     egui::Frame::canvas(ui.style()).show(ui, |ui| {
         ui.set_min_height(preview_height);
         ui.set_max_height(preview_height);
 
-        // Render video frame if available
         if let Some(ref texture) = app.preview_texture {
             let texture_size = texture.size_vec2();
             let aspect_ratio = texture_size.x / texture_size.y;
 
-            // Calculate display size maintaining aspect ratio
             let available = ui.available_size();
             let display_size = if available.x / available.y > aspect_ratio {
                 egui::vec2(available.y * aspect_ratio, available.y)
@@ -315,22 +168,21 @@ fn render_preview_area(app: &mut FFmpegApp, ui: &mut egui::Ui) {
             });
         } else {
             ui.centered_and_justified(|ui| {
-                ui.label("No file selected\nDrag & drop files or click 'Add Files'");
+                ui.label("No video loaded\nDrag & drop or File > Open Video...");
             });
         }
     });
 }
 
 fn render_playback_controls(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    // Row 1: Transport controls + time
     ui.horizontal(|ui| {
         let state = app.get_playback_state();
         let duration = app.get_duration();
 
-        // Playback buttons
-        if ui.button("|<").on_hover_text("Go to start (Home)").clicked() {
+        if ui.button("|<").on_hover_text("Start (Home)").clicked() {
             app.seek(0.0);
         }
-
         if ui.button("<<").on_hover_text("Rewind 10s (J)").clicked() {
             app.seek_relative(-10.0);
         }
@@ -346,18 +198,12 @@ fn render_playback_controls(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         if ui.button(">>").on_hover_text("Forward 10s (L)").clicked() {
             app.seek_relative(10.0);
         }
-
-        if ui.button(">|").on_hover_text("Go to end (End)").clicked() {
+        if ui.button(">|").on_hover_text("End (End)").clicked() {
             app.seek(duration);
-        }
-
-        if ui.button("[]").on_hover_text("Stop").clicked() {
-            app.stop_player();
         }
 
         ui.separator();
 
-        // Time display
         ui.label(format!(
             "{} / {}",
             format_time(app.current_time),
@@ -366,20 +212,19 @@ fn render_playback_controls(app: &mut FFmpegApp, ui: &mut egui::Ui) {
 
         ui.separator();
 
-        // Volume control
         ui.label("Vol:");
         let mut volume = app.volume;
         if ui.add(egui::Slider::new(&mut volume, 0.0..=2.0).show_value(false)).changed() {
             app.set_volume(volume);
         }
+    });
 
-        ui.separator();
-
-        // In/Out point buttons
-        if ui.button("[I").on_hover_text("Set In point (I)").clicked() {
+    // Row 2: I/O + Add segment
+    ui.horizontal(|ui| {
+        if ui.button("[I] In").on_hover_text("Set In point (I)").clicked() {
             app.set_in_point();
         }
-        if ui.button("O]").on_hover_text("Set Out point (O)").clicked() {
+        if ui.button("[O] Out").on_hover_text("Set Out point (O)").clicked() {
             app.set_out_point();
         }
 
@@ -389,6 +234,22 @@ fn render_playback_controls(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         }
         if let Some(out_pt) = app.out_point {
             ui.label(format!("OUT: {}", format_time(out_pt)));
+        }
+
+        ui.separator();
+
+        let can_add = app.in_point.is_some() && app.out_point.is_some();
+        if ui.add_enabled(can_add, egui::Button::new("+ Add Segment (S)"))
+            .on_hover_text("Create segment from IN/OUT points")
+            .clicked()
+        {
+            app.add_segment();
+        }
+
+        if (app.in_point.is_some() || app.out_point.is_some())
+            && ui.button("Clear").on_hover_text("Clear IN/OUT markers").clicked()
+        {
+            app.clear_in_out_points();
         }
     });
 
@@ -415,9 +276,10 @@ fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     let response = TimelineWidget::new(duration, app.current_time)
         .in_point(app.in_point)
         .out_point(app.out_point)
-        .waveform(app.waveform.as_ref())
         .zoom(app.timeline_zoom)
         .scroll(app.timeline_scroll)
+        .segments(&app.segments)
+        .selected_segment(app.selected_segment)
         .show(ui);
 
     if let Some(time) = response.seek_to {
@@ -429,158 +291,99 @@ fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     if let Some(scroll) = response.scroll_changed {
         app.timeline_scroll = scroll;
     }
-}
-
-fn render_tool_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    match app.active_tool {
-        ActiveTool::Convert => render_convert_tool(app, ui),
-        ActiveTool::Trim => render_trim_tool(app, ui),
-        ActiveTool::Crop => render_crop_tool(app, ui),
-        ActiveTool::Concat => render_concat_tool(app, ui),
-        ActiveTool::Filters => render_filters_tool(app, ui),
+    if let Some(idx) = response.segment_clicked {
+        app.selected_segment = Some(idx);
+    }
+    if response.is_scrubbing {
+        ui.ctx().request_repaint();
     }
 }
 
-fn render_convert_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Convert");
-    ui.label("Convert video/audio to different formats");
+fn render_segment_list(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    ui.heading("Segments");
 
-    ui.separator();
+    if app.segments.is_empty() {
+        ui.label("No segments defined.");
+        ui.label("Use I/O keys then press S to add segments.");
+        return;
+    }
 
-    egui::Grid::new("convert_settings").show(ui, |ui| {
-        ui.label("Output Format:");
-        egui::ComboBox::from_id_salt("format_select")
-            .selected_text(&app.export_settings.format)
-            .show_ui(ui, |ui| {
-                for format in SUPPORTED_VIDEO_FORMATS {
-                    if ui
-                        .selectable_label(app.export_settings.format == *format, *format)
-                        .clicked()
-                    {
-                        app.export_settings.set_format(format);
+    let mut to_remove: Option<usize> = None;
+    let mut to_select: Option<usize> = None;
+    let mut toggle_enable: Option<usize> = None;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(200.0)
+        .show(ui, |ui| {
+            for (i, seg) in app.segments.iter().enumerate() {
+                let is_selected = app.selected_segment == Some(i);
+
+                ui.horizontal(|ui| {
+                    // Checkbox
+                    let mut enabled = seg.enabled;
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        toggle_enable = Some(i);
                     }
-                }
-                ui.separator();
-                for format in SUPPORTED_AUDIO_FORMATS {
-                    if ui
-                        .selectable_label(app.export_settings.format == *format, *format)
-                        .clicked()
-                    {
-                        app.export_settings.set_format(format);
-                    }
-                }
-            });
-        ui.end_row();
 
-        ui.label("Quality Preset:");
-        egui::ComboBox::from_id_salt("preset_select")
-            .selected_text(app.export_settings.preset.name())
-            .show_ui(ui, |ui| {
-                for preset in ExportPreset::all() {
-                    if ui
-                        .selectable_label(app.export_settings.preset == *preset, preset.name())
-                        .clicked()
-                    {
-                        app.export_settings.apply_preset(*preset);
-                    }
-                }
-            });
-        ui.end_row();
+                    // Segment info (clickable)
+                    let label = format!(
+                        "#{} {} - {} (~{})",
+                        i + 1,
+                        format_time(seg.start_time),
+                        format_time(seg.end_time),
+                        format_size(seg.estimated_size_bytes),
+                    );
 
-        if app.export_settings.preset == ExportPreset::Custom {
-            if let Some(ref mut crf) = app.export_settings.crf {
-                ui.label("CRF (Quality):");
-                ui.add(egui::Slider::new(crf, 0..=51).suffix(""));
-                ui.end_row();
+                    let response = ui.selectable_label(is_selected, &label);
+                    if response.clicked() {
+                        to_select = Some(i);
+                    }
+
+                    // Delete button
+                    if ui.small_button("x").on_hover_text("Remove segment (Del)").clicked() {
+                        to_remove = Some(i);
+                    }
+                });
             }
+        });
 
-            ui.label("Audio Bitrate:");
-            let mut abitrate = app.export_settings.audio_bitrate.unwrap_or(192);
-            if ui
-                .add(egui::Slider::new(&mut abitrate, 64..=320).suffix(" kbps"))
-                .changed()
-            {
-                app.export_settings.audio_bitrate = Some(abitrate);
-            }
-            ui.end_row();
-        }
-    });
+    if let Some(idx) = toggle_enable {
+        app.segments[idx].enabled = !app.segments[idx].enabled;
+    }
+    if let Some(idx) = to_select {
+        app.selected_segment = Some(idx);
+    }
+    if let Some(idx) = to_remove {
+        app.remove_segment(idx);
+    }
 
     ui.separator();
 
     ui.horizontal(|ui| {
-        if ui.button("Convert").clicked() {
-            app.execute_current_tool();
+        if ui.button("Select All").clicked() {
+            for seg in &mut app.segments {
+                seg.enabled = true;
+            }
+        }
+        if ui.button("Deselect All").clicked() {
+            for seg in &mut app.segments {
+                seg.enabled = false;
+            }
         }
     });
 }
 
-fn render_trim_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Trim / Cut");
-    ui.label("Extract a segment from the video");
+fn render_split_settings(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    ui.heading("Settings");
 
-    // Show tip about using in/out points
-    ui.colored_label(egui::Color32::LIGHT_BLUE, "Tip: Use I/O keys or the timeline to set In/Out points");
-
-    ui.separator();
-
-    let duration = app
-        .selected_file()
-        .map(|f| f.info.duration)
-        .unwrap_or(100.0);
-
-    egui::Grid::new("trim_settings").show(ui, |ui| {
-        ui.label("Start Time:");
-        ui.horizontal(|ui| {
-            let response = ui.text_edit_singleline(&mut app.trim_settings.start_time_str);
-            if response.lost_focus() {
-                if let Some(t) = crate::utils::parse_time(&app.trim_settings.start_time_str) {
-                    app.trim_settings.start_time = t.min(duration);
-                }
-                app.trim_settings.start_time_str = format_time(app.trim_settings.start_time);
-            }
-            if ui.button("Use IN").clicked() {
-                if let Some(in_pt) = app.in_point {
-                    app.trim_settings.start_time = in_pt;
-                    app.trim_settings.start_time_str = format_time(in_pt);
-                }
-            }
-        });
-        ui.end_row();
-
-        ui.label("End Time:");
-        ui.horizontal(|ui| {
-            let response = ui.text_edit_singleline(&mut app.trim_settings.end_time_str);
-            if response.lost_focus() {
-                if let Some(t) = crate::utils::parse_time(&app.trim_settings.end_time_str) {
-                    app.trim_settings.end_time = t.min(duration);
-                }
-                app.trim_settings.end_time_str = format_time(app.trim_settings.end_time);
-            }
-            if ui.button("Use OUT").clicked() {
-                if let Some(out_pt) = app.out_point {
-                    app.trim_settings.end_time = out_pt;
-                    app.trim_settings.end_time_str = format_time(out_pt);
-                }
-            }
-        });
-        ui.end_row();
-
-        ui.label("Duration:");
-        let trim_duration = app.trim_settings.end_time - app.trim_settings.start_time;
-        ui.label(format_time(trim_duration.max(0.0)));
-        ui.end_row();
-    });
-
-    ui.separator();
-
-    // Mode de trim avec radio buttons
-    ui.label("Export Mode:");
+    // Trim mode
+    ui.label("Mode:");
     ui.indent("trim_mode_indent", |ui| {
         for mode in TrimMode::all() {
-            let is_selected = app.trim_settings.mode == *mode;
+            let is_selected = app.split_settings.trim_mode == *mode;
             if ui.radio(is_selected, mode.name()).clicked() {
-                app.trim_settings.mode = *mode;
+                app.split_settings.trim_mode = *mode;
             }
             if is_selected {
                 ui.indent("mode_desc", |ui| {
@@ -592,294 +395,276 @@ fn render_trim_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
 
     ui.separator();
 
+    // Max size
     ui.horizontal(|ui| {
-        let button_text = match app.trim_settings.mode {
-            TrimMode::Lossless => "Cut (instant)",
-            TrimMode::Precise => "Cut (fast)",
-            TrimMode::HighQuality => "Cut (quality)",
-        };
-        if ui.button(button_text).clicked() {
-            app.execute_current_tool();
+        ui.label("Max size:");
+        let mut max_mb = app.split_settings.max_size_mb;
+        if ui.add(
+            egui::DragValue::new(&mut max_mb)
+                .range(0.0..=10000.0)
+                .speed(1.0)
+                .suffix(" MB")
+        ).changed() {
+            app.split_settings.max_size_mb = max_mb;
         }
+    });
+    if app.split_settings.max_size_mb > 0.0 {
+        ui.small("Segments exceeding this size will be auto-split.");
+    } else {
+        ui.small("0 = no size limit");
+    }
 
-        if ui.button("+ Add to Queue")
-            .on_hover_text("Add this cut to the export queue")
+    ui.separator();
+
+    // Auto-Cut button
+    ui.horizontal(|ui| {
+        let has_file = app.selected_file().is_some();
+        let has_max_size = app.split_settings.max_size_mb > 0.0;
+        let can_auto_cut = has_file && has_max_size && !app.auto_cut_running;
+
+        if ui
+            .add_enabled(can_auto_cut, egui::Button::new("Auto-Cut (silence-aware)"))
+            .on_hover_text("Detect silences and split at quiet moments")
             .clicked()
         {
-            app.add_trim_to_queue();
+            app.start_auto_cut();
         }
 
-        // Show queue status
-        let queue = app.export_queue.lock().unwrap();
-        let pending = queue.pending_count();
-        let completed = queue.completed_count();
-        drop(queue);
+        if app.auto_cut_running {
+            ui.spinner();
+            ui.label(&app.auto_cut_status);
+        }
+    });
+    if !app.auto_cut_running && !app.auto_cut_status.is_empty() {
+        ui.small(&app.auto_cut_status);
+    }
 
-        if pending > 0 || completed > 0 {
-            ui.separator();
-            let queue_text = format!("Queue: {} pending, {} done", pending, completed);
-            if ui.button(&queue_text).clicked() {
-                app.show_queue_panel = !app.show_queue_panel;
+    ui.separator();
+
+    // Batch processing section
+    let file_count = app.project.files.len();
+    let has_multiple_files = file_count > 1;
+    let has_max_size = app.split_settings.max_size_mb > 0.0;
+    let is_busy = app.batch_running || app.auto_cut_running;
+
+    if has_multiple_files {
+        ui.horizontal(|ui| {
+            // Combined: detect + export in one click
+            let can_process = has_max_size && !is_busy;
+            let process_label = format!("Process & Export All ({} files)", file_count);
+            if ui
+                .add_enabled(can_process, egui::Button::new(&process_label))
+                .on_hover_text("Detect silences on all files in parallel, then export all segments into per-file folders")
+                .clicked()
+            {
+                app.batch_process_and_export();
+            }
+
+            if app.batch_running {
+                ui.spinner();
+                ui.label(&app.batch_status);
+            }
+        });
+
+        // Separate buttons for more control
+        ui.horizontal(|ui| {
+            let can_batch = has_max_size && !is_busy;
+            if ui
+                .add_enabled(can_batch, egui::Button::new("Batch Auto-Cut only"))
+                .on_hover_text("Detect silences on all files (without exporting)")
+                .clicked()
+            {
+                app.start_batch_auto_cut();
+            }
+
+            // Export All button (only if segments exist)
+            let files_with_segs = app.files_with_segments_count();
+            let total_segs = app.total_segments_all_files();
+            if files_with_segs > 0 && !is_busy {
+                let export_label = format!("Export All ({} segs, {} files)", total_segs, files_with_segs);
+                if ui.button(&export_label)
+                    .on_hover_text("Export all files' segments into per-file subfolders")
+                    .clicked()
+                {
+                    app.export_all_files();
+                }
+            }
+        });
+
+        if !app.batch_running && !app.batch_status.is_empty() {
+            ui.small(&app.batch_status);
+        }
+
+        // Show per-file segment summary
+        {
+            let files_with_segs = app.files_with_segments_count();
+            let total_segs = app.total_segments_all_files();
+            if total_segs > 0 {
+                ui.small(format!("{} segments across {} file(s)", total_segs, files_with_segs));
+            }
+        }
+    }
+
+    ui.separator();
+
+    // Output folder
+    ui.horizontal(|ui| {
+        ui.label("Output:");
+        let folder_text = app.split_settings.output_folder
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Same as source".to_string());
+        ui.label(&folder_text);
+    });
+
+    ui.horizontal(|ui| {
+        if ui.button("Browse...").clicked() {
+            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                app.split_settings.output_folder = Some(folder);
+            }
+        }
+        if app.split_settings.output_folder.is_some() {
+            if ui.button("Reset").clicked() {
+                app.split_settings.output_folder = None;
             }
         }
     });
 
-    ui.separator();
+    // ---- Merge Videos section ----
+    if app.project.files.len() >= 2 {
+        ui.separator();
+        ui.heading("Merge Videos");
+        ui.small("Assemble all files into one video (re-encode)");
 
-    ui.horizontal(|ui| {
-        // Quick access to external tools
-        if ui.button("LosslessCut")
-            .on_hover_text("Open in LosslessCut (requires installation)")
-            .clicked()
-        {
-            app.open_in_losslesscut();
-        }
-        if ui.button("mpv")
-            .on_hover_text("Preview in mpv (requires installation)")
-            .clicked()
-        {
-            app.open_in_mpv();
-        }
-    });
-}
+        // Sync order with loaded files
+        app.sync_merge_order();
+        let order = app.merge_file_order.clone();
 
-fn render_crop_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Crop");
-    ui.label("Crop video to a specific region");
+        let mut move_up: Option<usize> = None;
+        let mut move_down: Option<usize> = None;
 
-    ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .id_salt("merge_order_scroll")
+            .show(ui, |ui| {
+                for (pos, &file_idx) in order.iter().enumerate() {
+                    if let Some(file) = app.project.files.get(file_idx) {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}.", pos + 1));
 
-    let (source_w, source_h) = app
-        .selected_file()
-        .map(|f| (f.info.width, f.info.height))
-        .unwrap_or((1920, 1080));
+                            let can_up = pos > 0;
+                            let can_down = pos + 1 < order.len();
+                            if ui.add_enabled(can_up, egui::Button::new("\u{2191}").small()).clicked() {
+                                move_up = Some(pos);
+                            }
+                            if ui.add_enabled(can_down, egui::Button::new("\u{2193}").small()).clicked() {
+                                move_down = Some(pos);
+                            }
 
-    egui::Grid::new("crop_settings").show(ui, |ui| {
-        ui.label("Aspect Ratio:");
-        egui::ComboBox::from_id_salt("crop_preset")
-            .selected_text(app.crop_settings.preset.name())
-            .show_ui(ui, |ui| {
-                for preset in CropPreset::all() {
-                    if ui
-                        .selectable_label(app.crop_settings.preset == *preset, preset.name())
-                        .clicked()
-                    {
-                        app.crop_settings.apply_preset(*preset, source_w, source_h);
+                            ui.label(file.filename());
+                        });
                     }
                 }
             });
-        ui.end_row();
 
-        ui.label("X Offset:");
-        ui.add(egui::DragValue::new(&mut app.crop_settings.x).range(0..=source_w));
-        ui.end_row();
-
-        ui.label("Y Offset:");
-        ui.add(egui::DragValue::new(&mut app.crop_settings.y).range(0..=source_h));
-        ui.end_row();
-
-        ui.label("Width:");
-        ui.add(egui::DragValue::new(&mut app.crop_settings.width).range(1..=source_w));
-        ui.end_row();
-
-        ui.label("Height:");
-        ui.add(egui::DragValue::new(&mut app.crop_settings.height).range(1..=source_h));
-        ui.end_row();
-    });
-
-    ui.separator();
-
-    ui.horizontal(|ui| {
-        if ui.button("Crop").clicked() {
-            app.execute_current_tool();
+        if let Some(pos) = move_up {
+            app.merge_move_up(pos);
         }
-    });
-}
+        if let Some(pos) = move_down {
+            app.merge_move_down(pos);
+        }
 
-fn render_concat_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Concatenate");
-    ui.label("Join multiple files together in order");
+        // Merge button
+        let is_busy = app.export_queue.lock().map(|q| q.is_processing).unwrap_or(false);
+        let can_merge = app.merge_file_order.len() >= 2 && !is_busy;
 
-    ui.separator();
+        ui.horizontal(|ui| {
+            let merge_label = format!("Merge All ({} files)", app.merge_file_order.len());
+            if ui.add_enabled(can_merge, egui::Button::new(&merge_label)).clicked() {
+                app.start_merge();
+            }
 
-    ui.label(format!(
-        "{} files selected for concatenation",
-        app.project.files.len()
-    ));
+            if is_busy && app.show_export_progress {
+                ui.spinner();
+            }
+        });
 
-    if app.project.files.len() < 2 {
-        ui.colored_label(egui::Color32::YELLOW, "Add at least 2 files to concatenate");
-    } else {
-        ui.label("Files will be joined in the order shown in the file list.");
-
-        let total_duration: f64 = app.project.files.iter().map(|f| f.info.duration).sum();
-        ui.label(format!("Total duration: {}", format_time(total_duration)));
+        // Estimate total duration
+        let total_dur: f64 = app.merge_file_order.iter()
+            .filter_map(|&i| app.project.files.get(i))
+            .map(|f| f.info.duration)
+            .sum();
+        if total_dur > 0.0 {
+            ui.small(format!("Total: {}", format_time(total_dur)));
+        }
     }
-
-    ui.separator();
-
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(app.project.files.len() >= 2, egui::Button::new("Concatenate"))
-            .clicked()
-        {
-            app.execute_current_tool();
-        }
-    });
 }
 
-fn render_filters_tool(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.heading("Filters");
-    ui.label("Apply video and audio filters");
-
-    ui.separator();
-
-    let (source_w, source_h) = app
-        .selected_file()
-        .map(|f| (f.info.width, f.info.height))
-        .unwrap_or((1920, 1080));
-
-    ui.collapsing("Resize", |ui| {
-        let mut enable_resize = app.filter_settings.resize.is_some();
-        if ui.checkbox(&mut enable_resize, "Enable resize").changed() {
-            app.filter_settings.resize = if enable_resize {
-                Some((source_w, source_h))
-            } else {
-                None
-            };
-        }
-
-        if let Some(ref mut size) = app.filter_settings.resize {
-            egui::Grid::new("resize_grid").show(ui, |ui| {
-                ui.label("Width:");
-                ui.add(egui::DragValue::new(&mut size.0).range(1..=7680));
-                ui.end_row();
-
-                ui.label("Height:");
-                ui.add(egui::DragValue::new(&mut size.1).range(1..=4320));
-                ui.end_row();
-            });
-        }
-    });
-
-    ui.collapsing("Rotation", |ui| {
-        let mut rotation = app.filter_settings.rotation.unwrap_or(0);
-        ui.horizontal(|ui| {
-            if ui.radio_value(&mut rotation, 0, "None").clicked() {
-                app.filter_settings.rotation = None;
-            }
-            if ui.radio_value(&mut rotation, 90, "90").clicked() {
-                app.filter_settings.rotation = Some(90);
-            }
-            if ui.radio_value(&mut rotation, 180, "180").clicked() {
-                app.filter_settings.rotation = Some(180);
-            }
-            if ui.radio_value(&mut rotation, 270, "270").clicked() {
-                app.filter_settings.rotation = Some(270);
-            }
-        });
-    });
-
-    ui.collapsing("Flip", |ui| {
-        ui.checkbox(&mut app.filter_settings.flip_horizontal, "Horizontal flip");
-        ui.checkbox(&mut app.filter_settings.flip_vertical, "Vertical flip");
-    });
-
-    ui.collapsing("Audio", |ui| {
-        let mut volume = app.filter_settings.volume.unwrap_or(1.0);
-        ui.horizontal(|ui| {
-            ui.label("Volume:");
-            if ui
-                .add(egui::Slider::new(&mut volume, 0.0..=3.0).suffix("x"))
-                .changed()
-            {
-                app.filter_settings.volume = Some(volume);
-            }
-        });
-
-        ui.checkbox(&mut app.filter_settings.normalize_audio, "Normalize audio");
-    });
-
-    ui.separator();
-
+fn render_export_bar(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        if ui.button("Apply Filters").clicked() {
-            app.execute_current_tool();
+        let enabled_count = app.segments.iter().filter(|s| s.enabled).count();
+        let total_size: u64 = app.segments.iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.estimated_size_bytes)
+            .sum();
+
+        let has_segments = enabled_count > 0;
+
+        // Export button
+        let button_text = format!(
+            "EXPORT ({} segment(s), ~{})",
+            enabled_count,
+            format_size(total_size)
+        );
+
+        if ui.add_enabled(has_segments, egui::Button::new(&button_text)).clicked() {
+            app.save_current_segments();
+            app.export_all();
         }
-    });
-}
 
-fn render_queue_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.heading("Export Queue");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("X").clicked() {
-                app.show_queue_panel = false;
-            }
-        });
-    });
-
-    ui.separator();
-
-    // Queue stats
-    let (pending, completed, is_processing) = {
+        // Progress bar if processing
         let queue = app.export_queue.lock().unwrap();
-        (queue.pending_count(), queue.completed_count(), queue.is_processing)
-    };
+        let (completed, total) = queue.total_progress();
+        let is_processing = queue.is_processing;
+        drop(queue);
 
-    ui.horizontal(|ui| {
-        if is_processing {
-            ui.spinner();
-            ui.label("Processing...");
-        } else if pending > 0 {
-            ui.label(format!("{} jobs pending", pending));
-        } else {
-            ui.label("Queue empty");
+        if total > 0 && (is_processing || app.show_export_progress) {
+            ui.separator();
+            if is_processing {
+                ui.spinner();
+            }
+            let progress = if total > 0 { completed as f32 / total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(progress)
+                .text(format!("{}/{}", completed, total))
+                .desired_width(150.0));
+
+            // Stop All button — cancel pending exports
+            if completed < total && ui.button("Stop All").on_hover_text("Cancel all pending exports").clicked() {
+                app.cancel_exports();
+            }
+
+            if completed == total && !is_processing {
+                if ui.button("Clear").clicked() {
+                    app.clear_finished_jobs();
+                    app.show_export_progress = false;
+                }
+            }
         }
+
+        // Quick open new file (for chained workflow)
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Open Next Video...").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm", "ts", "flv"])
+                    .add_filter("All Files", &["*"])
+                    .pick_files()
+                {
+                    app.add_files(paths);
+                    // Select the last added file
+                    let last = app.project.files.len().saturating_sub(1);
+                    app.select_file(last);
+                }
+            }
+        });
     });
-
-    if completed > 0 {
-        ui.horizontal(|ui| {
-            ui.label(format!("{} completed", completed));
-            if ui.small_button("Clear done").clicked() {
-                app.clear_finished_jobs();
-            }
-        });
-    }
-
-    ui.separator();
-
-    // Job list
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let jobs: Vec<_> = {
-                let queue = app.export_queue.lock().unwrap();
-                queue.jobs.iter().map(|j| (j.id, j.description(), j.status_text().to_string(), j.status.clone())).collect()
-            };
-
-            for (id, desc, status_text, status) in jobs {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        // Status indicator
-                        let color = match &status {
-                            crate::export_queue::JobStatus::Pending => egui::Color32::GRAY,
-                            crate::export_queue::JobStatus::Running => egui::Color32::YELLOW,
-                            crate::export_queue::JobStatus::Completed => egui::Color32::GREEN,
-                            crate::export_queue::JobStatus::Failed(_) => egui::Color32::RED,
-                        };
-                        ui.colored_label(color, "●");
-                        ui.label(&status_text);
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("x").clicked() {
-                                let mut queue = app.export_queue.lock().unwrap();
-                                queue.remove_job(id);
-                            }
-                        });
-                    });
-                    ui.small(&desc);
-                });
-            }
-        });
 }

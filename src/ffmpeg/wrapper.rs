@@ -1,7 +1,7 @@
 use super::commands::*;
 use super::probe::{probe_file, MediaInfo};
-use crate::project::ExportSettings;
-use crate::ui::{FilterSettings, TrimMode};
+use super::silence::{build_silence_detect_args, parse_silence_output, SilenceInterval};
+use crate::ui::TrimMode;
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -45,17 +45,6 @@ impl FFmpegWrapper {
         probe_file(path)
     }
 
-    /// Convert a media file to a different format
-    pub async fn convert(
-        &self,
-        input: &PathBuf,
-        output: &PathBuf,
-        settings: &ExportSettings,
-    ) -> Result<()> {
-        let args = build_convert_args(input, output, settings);
-        self.execute_ffmpeg(&args).await
-    }
-
     /// Trim a video between start and end times
     pub async fn trim(
         &self,
@@ -69,69 +58,31 @@ impl FFmpegWrapper {
         self.execute_ffmpeg(&args).await
     }
 
-    /// Crop a video to specified dimensions
-    pub async fn crop(
-        &self,
-        input: &PathBuf,
-        output: &PathBuf,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
-        let args = build_crop_args(input, output, x, y, width, height);
-        self.execute_ffmpeg(&args).await
-    }
-
-    /// Concatenate multiple files
-    pub async fn concat(&self, inputs: &[PathBuf], output: &PathBuf) -> Result<()> {
-        // Create temporary list file
-        let list_file = std::env::temp_dir().join("ffmpeg_concat_list.txt");
-        let list_content: String = inputs
-            .iter()
-            .map(|p| format!("file '{}'", p.to_string_lossy().replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        std::fs::write(&list_file, list_content)?;
-
-        let args = build_concat_args(inputs, output, &list_file);
-        let result = self.execute_ffmpeg(&args).await;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&list_file);
-
-        result
-    }
-
-    /// Apply filters to a video
-    pub async fn apply_filters(
-        &self,
-        input: &PathBuf,
-        output: &PathBuf,
-        filters: &FilterSettings,
-    ) -> Result<()> {
-        let args = build_filter_args(input, output, filters);
-        self.execute_ffmpeg(&args).await
-    }
-
     /// Execute an FFmpeg command with the given arguments
     async fn execute_ffmpeg(&self, args: &[String]) -> Result<()> {
-        let mut child = Command::new(&self.ffmpeg_path)
-            .args(args)
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        cmd.args(args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+
+        // On Windows GUI apps, prevent FFmpeg from creating a console window
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd.spawn()
+            .map_err(|e| anyhow!("Failed to start FFmpeg: {}. Is FFmpeg installed and in PATH?", e))?;
 
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to capture stderr"))?;
         let mut reader = BufReader::new(stderr).lines();
 
-        // Read progress output
+        // Collect stderr output for error reporting
+        let mut error_lines = Vec::new();
         while let Some(line) = reader.next_line().await? {
-            // Progress parsing could be done here
-            // For now, we just log errors
-            if line.contains("Error") || line.contains("error") {
-                eprintln!("FFmpeg: {}", line);
+            if line.contains("Error") || line.contains("error") || line.contains("Invalid") {
+                error_lines.push(line);
             }
         }
 
@@ -140,8 +91,91 @@ impl FFmpegWrapper {
         if status.success() {
             Ok(())
         } else {
-            Err(anyhow!("FFmpeg exited with status: {}", status))
+            let error_detail = if error_lines.is_empty() {
+                format!("FFmpeg exited with status: {}", status)
+            } else {
+                format!("FFmpeg error: {}", error_lines.join("; "))
+            };
+            Err(anyhow!(error_detail))
         }
+    }
+
+    /// Detect silence intervals in a media file using FFmpeg's silencedetect filter.
+    pub async fn detect_silence(
+        &self,
+        input: &PathBuf,
+        noise_db: f64,
+        min_duration: f64,
+    ) -> Result<Vec<SilenceInterval>> {
+        let input_str = input.to_string_lossy().to_string();
+        let args = build_silence_detect_args(&input_str, noise_db, min_duration);
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        cmd.args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow!(
+                "Failed to start FFmpeg for silence detection: {}. Is FFmpeg installed and in PATH?",
+                e
+            )
+        })?;
+
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stderr for silence detection"))?;
+        let mut reader = BufReader::new(stderr).lines();
+
+        let mut all_lines = Vec::new();
+        while let Some(line) = reader.next_line().await? {
+            all_lines.push(line);
+        }
+
+        let _ = child.wait().await?;
+
+        Ok(parse_silence_output(&all_lines))
+    }
+
+    /// Concatenate multiple video files into one using the concat demuxer.
+    /// Creates a temp file list, runs FFmpeg, then cleans up.
+    pub async fn concat(
+        &self,
+        inputs: &[PathBuf],
+        output: &PathBuf,
+    ) -> Result<()> {
+        if inputs.is_empty() {
+            return Err(anyhow!("No input files for concatenation"));
+        }
+
+        // Create concat list file next to output
+        let list_path = output.with_file_name("_concat_list.txt");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&list_path)
+                .map_err(|e| anyhow!("Failed to create concat list: {}", e))?;
+            for input in inputs {
+                // Use forward slashes and escape single quotes for FFmpeg
+                let path_str = input.to_string_lossy().replace('\\', "/");
+                writeln!(f, "file '{}'", path_str.replace('\'', "'\\''"))
+                    .map_err(|e| anyhow!("Failed to write concat list: {}", e))?;
+            }
+        }
+
+        let args = super::commands::build_concat_args(&list_path, output);
+        let result = self.execute_ffmpeg(&args).await;
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(&list_path);
+
+        result
     }
 
     /// Extract a single frame as thumbnail

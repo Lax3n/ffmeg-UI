@@ -1,16 +1,29 @@
-use crate::player::WaveformData;
+use crate::ui::SplitSegment;
 use crate::utils::format_time;
 use eframe::egui;
 
-/// Timeline widget with waveform visualization
+/// Palette de couleurs pour les segments
+const SEGMENT_COLORS: [(u8, u8, u8); 8] = [
+    (100, 200, 100),  // vert
+    (100, 149, 237),  // bleu
+    (237, 149, 100),  // orange
+    (200, 100, 200),  // violet
+    (237, 237, 100),  // jaune
+    (100, 237, 237),  // cyan
+    (237, 100, 149),  // rose
+    (149, 237, 100),  // lime
+];
+
+/// Timeline widget with waveform visualization and multi-segment support
 pub struct TimelineWidget<'a> {
     pub duration: f64,
     pub current_time: f64,
     pub in_point: Option<f64>,
     pub out_point: Option<f64>,
-    pub waveform: Option<&'a WaveformData>,
     pub zoom: f32,
     pub scroll: f32,
+    pub segments: &'a [SplitSegment],
+    pub selected_segment: Option<usize>,
 }
 
 impl<'a> TimelineWidget<'a> {
@@ -20,9 +33,10 @@ impl<'a> TimelineWidget<'a> {
             current_time,
             in_point: None,
             out_point: None,
-            waveform: None,
             zoom: 1.0,
             scroll: 0.0,
+            segments: &[],
+            selected_segment: None,
         }
     }
 
@@ -36,11 +50,6 @@ impl<'a> TimelineWidget<'a> {
         self
     }
 
-    pub fn waveform(mut self, waveform: Option<&'a WaveformData>) -> Self {
-        self.waveform = waveform;
-        self
-    }
-
     pub fn zoom(mut self, zoom: f32) -> Self {
         self.zoom = zoom;
         self
@@ -51,12 +60,24 @@ impl<'a> TimelineWidget<'a> {
         self
     }
 
+    pub fn segments(mut self, segments: &'a [SplitSegment]) -> Self {
+        self.segments = segments;
+        self
+    }
+
+    pub fn selected_segment(mut self, selected: Option<usize>) -> Self {
+        self.selected_segment = selected;
+        self
+    }
+
     /// Show the timeline widget and return seek position if clicked
     pub fn show(self, ui: &mut egui::Ui) -> TimelineResponse {
         let mut response = TimelineResponse {
             seek_to: None,
             zoom_changed: None,
             scroll_changed: None,
+            segment_clicked: None,
+            is_scrubbing: false,
         };
 
         if self.duration <= 0.0 {
@@ -109,18 +130,36 @@ impl<'a> TimelineWidget<'a> {
             // Draw track background
             painter.rect_filled(track_rect, 2.0, egui::Color32::from_gray(40));
 
-            // Draw in/out selection
-            self.draw_selection(&painter, track_rect, scroll_time, visible_duration);
+            // Draw all segments
+            self.draw_segments(&painter, track_rect, scroll_time, visible_duration);
+
+            // Draw in/out working markers (dashed style)
+            self.draw_working_markers(&painter, track_rect, scroll_time, visible_duration);
 
             // Draw playhead
             self.draw_playhead(&painter, rect, scroll_time, visible_duration);
 
-            // Handle click to seek
+            // Handle click — always seek, and also detect segment clicks
             if ui_response.clicked() {
                 if let Some(pos) = ui_response.interact_pointer_pos() {
                     let relative_x = (pos.x - rect.left()) / rect.width();
-                    let seek_time = scroll_time + relative_x as f64 * visible_duration;
-                    response.seek_to = Some(seek_time.clamp(0.0, self.duration));
+                    let click_time = scroll_time + relative_x as f64 * visible_duration;
+
+                    // Check if a segment was clicked
+                    let pixels_per_second = track_rect.width() / visible_duration as f32;
+                    if pos.y >= track_rect.top() && pos.y <= track_rect.bottom() {
+                        for (i, seg) in self.segments.iter().enumerate() {
+                            let seg_start_x = track_rect.left() + ((seg.start_time - scroll_time) as f32 * pixels_per_second);
+                            let seg_end_x = track_rect.left() + ((seg.end_time - scroll_time) as f32 * pixels_per_second);
+                            if pos.x >= seg_start_x && pos.x <= seg_end_x {
+                                response.segment_clicked = Some(i);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Always seek on click
+                    response.seek_to = Some(click_time.clamp(0.0, self.duration));
                 }
             }
 
@@ -131,12 +170,21 @@ impl<'a> TimelineWidget<'a> {
                 response.zoom_changed = Some(new_zoom);
             }
 
-            // Handle drag for scroll
+            // Handle drag: normal drag = scrub (seek), Ctrl+drag = pan
             if ui_response.dragged() {
-                let delta = ui_response.drag_delta().x;
-                let scroll_delta = -delta / rect.width() * (self.duration / self.zoom as f64) as f32;
-                let new_scroll = (self.scroll + scroll_delta / self.duration as f32).clamp(0.0, 1.0);
-                response.scroll_changed = Some(new_scroll);
+                if ui.input(|i| i.modifiers.ctrl) {
+                    // Ctrl+drag = pan (old behavior)
+                    let delta = ui_response.drag_delta().x;
+                    let scroll_delta = -delta / rect.width() * (self.duration / self.zoom as f64) as f32;
+                    let new_scroll = (self.scroll + scroll_delta / self.duration as f32).clamp(0.0, 1.0);
+                    response.scroll_changed = Some(new_scroll);
+                } else if let Some(pos) = ui_response.interact_pointer_pos() {
+                    // Normal drag = scrub (continuous seek)
+                    let relative_x = (pos.x - rect.left()) / rect.width();
+                    let drag_time = scroll_time + relative_x as f64 * visible_duration;
+                    response.seek_to = Some(drag_time.clamp(0.0, self.duration));
+                    response.is_scrubbing = true;
+                }
             }
         }
 
@@ -146,13 +194,10 @@ impl<'a> TimelineWidget<'a> {
     fn draw_ruler(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
         let pixels_per_second = rect.width() / visible_duration as f32;
 
-        // Determine step based on zoom level
         let step = self.calculate_ruler_step(pixels_per_second);
 
-        // Draw ruler background
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(35));
 
-        // Calculate start time (aligned to step)
         let start_time = (scroll_time / step).floor() * step;
 
         let mut time = start_time;
@@ -160,14 +205,12 @@ impl<'a> TimelineWidget<'a> {
             let x = rect.left() + ((time - scroll_time) as f32 * pixels_per_second);
 
             if x >= rect.left() && x <= rect.right() {
-                // Draw tick
                 let tick_height = if (time / step) as i32 % 5 == 0 { 12.0 } else { 6.0 };
                 painter.line_segment(
                     [egui::pos2(x, rect.bottom() - tick_height), egui::pos2(x, rect.bottom())],
                     egui::Stroke::new(1.0, egui::Color32::GRAY),
                 );
 
-                // Draw time label for major ticks
                 if (time / step) as i32 % 5 == 0 {
                     painter.text(
                         egui::pos2(x + 2.0, rect.top() + 2.0),
@@ -183,57 +226,60 @@ impl<'a> TimelineWidget<'a> {
         }
     }
 
-    fn draw_waveform(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
-        // Waveform background
+    fn draw_waveform(&self, painter: &egui::Painter, rect: egui::Rect, _scroll_time: f64, _visible_duration: f64) {
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
+    }
 
-        let Some(waveform) = self.waveform else {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Loading waveform...",
-                egui::FontId::proportional(12.0),
-                egui::Color32::GRAY,
+    fn draw_segments(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
+        let pixels_per_second = rect.width() / visible_duration as f32;
+
+        for (i, seg) in self.segments.iter().enumerate() {
+            if !seg.enabled {
+                continue;
+            }
+
+            let start_x = rect.left() + ((seg.start_time - scroll_time) as f32 * pixels_per_second);
+            let end_x = rect.left() + ((seg.end_time - scroll_time) as f32 * pixels_per_second);
+
+            if start_x > rect.right() || end_x < rect.left() {
+                continue;
+            }
+
+            let (r, g, b) = SEGMENT_COLORS[i % SEGMENT_COLORS.len()];
+            let is_selected = self.selected_segment == Some(i);
+            let alpha = if is_selected { 120 } else { 60 };
+
+            let seg_rect = egui::Rect::from_min_max(
+                egui::pos2(start_x.max(rect.left()), rect.top()),
+                egui::pos2(end_x.min(rect.right()), rect.bottom()),
             );
-            return;
-        };
 
-        if waveform.peaks.is_empty() {
-            return;
-        }
+            // Fill
+            painter.rect_filled(seg_rect, 0.0, egui::Color32::from_rgba_unmultiplied(r, g, b, alpha));
 
-        let peaks_per_second = waveform.peaks.len() as f64 / waveform.duration;
-        let start_peak = ((scroll_time * peaks_per_second) as usize).min(waveform.peaks.len());
-        let end_peak = (((scroll_time + visible_duration) * peaks_per_second) as usize).min(waveform.peaks.len());
+            // Border for selected segment
+            if is_selected {
+                painter.rect_stroke(seg_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(r, g, b)));
+            }
 
-        if start_peak >= end_peak {
-            return;
-        }
-
-        let peak_width = rect.width() / (end_peak - start_peak) as f32;
-        let center_y = rect.center().y;
-        let max_height = rect.height() / 2.0 - 2.0;
-
-        for (i, peak_idx) in (start_peak..end_peak).enumerate() {
-            let peak = waveform.peaks[peak_idx];
-            let x = rect.left() + i as f32 * peak_width;
-            let height = peak * max_height;
-
-            painter.rect_filled(
-                egui::Rect::from_center_size(
-                    egui::pos2(x + peak_width / 2.0, center_y),
-                    egui::vec2(peak_width.max(1.0), height * 2.0),
-                ),
-                0.0,
-                egui::Color32::from_rgb(100, 149, 237), // Cornflower blue
-            );
+            // Label
+            let label_width = seg_rect.width();
+            if label_width > 30.0 {
+                painter.text(
+                    egui::pos2(seg_rect.left() + 4.0, seg_rect.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    &seg.label,
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::WHITE,
+                );
+            }
         }
     }
 
-    fn draw_selection(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
+    fn draw_working_markers(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
         let pixels_per_second = rect.width() / visible_duration as f32;
 
-        // Draw in/out selection region
+        // Draw in/out working selection (dashed)
         if let (Some(in_pt), Some(out_pt)) = (self.in_point, self.out_point) {
             let in_x = rect.left() + ((in_pt - scroll_time) as f32 * pixels_per_second);
             let out_x = rect.left() + ((out_pt - scroll_time) as f32 * pixels_per_second);
@@ -246,44 +292,50 @@ impl<'a> TimelineWidget<'a> {
                 painter.rect_filled(
                     selection_rect,
                     0.0,
-                    egui::Color32::from_rgba_unmultiplied(100, 200, 100, 60),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25),
+                );
+                // Dashed border
+                painter.rect_stroke(
+                    selection_rect,
+                    0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100)),
                 );
             }
         }
 
-        // Draw in point marker
+        // In point marker
         if let Some(in_pt) = self.in_point {
             let x = rect.left() + ((in_pt - scroll_time) as f32 * pixels_per_second);
             if x >= rect.left() && x <= rect.right() {
                 painter.rect_filled(
-                    egui::Rect::from_min_size(egui::pos2(x - 3.0, rect.top()), egui::vec2(6.0, rect.height())),
-                    2.0,
+                    egui::Rect::from_min_size(egui::pos2(x - 2.0, rect.top()), egui::vec2(4.0, rect.height())),
+                    1.0,
                     egui::Color32::GREEN,
                 );
                 painter.text(
-                    egui::pos2(x + 5.0, rect.top() + 2.0),
+                    egui::pos2(x + 4.0, rect.bottom() - 12.0),
                     egui::Align2::LEFT_TOP,
                     "IN",
-                    egui::FontId::proportional(10.0),
+                    egui::FontId::proportional(9.0),
                     egui::Color32::GREEN,
                 );
             }
         }
 
-        // Draw out point marker
+        // Out point marker
         if let Some(out_pt) = self.out_point {
             let x = rect.left() + ((out_pt - scroll_time) as f32 * pixels_per_second);
             if x >= rect.left() && x <= rect.right() {
                 painter.rect_filled(
-                    egui::Rect::from_min_size(egui::pos2(x - 3.0, rect.top()), egui::vec2(6.0, rect.height())),
-                    2.0,
+                    egui::Rect::from_min_size(egui::pos2(x - 2.0, rect.top()), egui::vec2(4.0, rect.height())),
+                    1.0,
                     egui::Color32::RED,
                 );
                 painter.text(
-                    egui::pos2(x + 5.0, rect.top() + 2.0),
+                    egui::pos2(x + 4.0, rect.bottom() - 12.0),
                     egui::Align2::LEFT_TOP,
                     "OUT",
-                    egui::FontId::proportional(10.0),
+                    egui::FontId::proportional(9.0),
                     egui::Color32::RED,
                 );
             }
@@ -295,22 +347,30 @@ impl<'a> TimelineWidget<'a> {
         let x = rect.left() + ((self.current_time - scroll_time) as f32 * pixels_per_second);
 
         if x >= rect.left() && x <= rect.right() {
-            // Playhead line
+            let playhead_color = egui::Color32::from_rgb(255, 80, 80);
+
+            // Halo / shadow behind the line (4px wide, semi-transparent)
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::Stroke::new(4.0, egui::Color32::from_rgba_unmultiplied(255, 80, 80, 60)),
             );
 
-            // Playhead triangle at top
+            // Main playhead line (2px, red)
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(2.0, playhead_color),
+            );
+
+            // Triangle (8px wide, 14px tall) with white border
             let triangle = vec![
-                egui::pos2(x, rect.top() + 10.0),
-                egui::pos2(x - 6.0, rect.top()),
-                egui::pos2(x + 6.0, rect.top()),
+                egui::pos2(x, rect.top() + 14.0),
+                egui::pos2(x - 8.0, rect.top()),
+                egui::pos2(x + 8.0, rect.top()),
             ];
             painter.add(egui::Shape::convex_polygon(
-                triangle,
-                egui::Color32::WHITE,
-                egui::Stroke::NONE,
+                triangle.clone(),
+                playhead_color,
+                egui::Stroke::new(1.0, egui::Color32::WHITE),
             ));
         }
     }
@@ -333,4 +393,6 @@ pub struct TimelineResponse {
     pub seek_to: Option<f64>,
     pub zoom_changed: Option<f32>,
     pub scroll_changed: Option<f32>,
+    pub segment_clicked: Option<usize>,
+    pub is_scrubbing: bool,
 }

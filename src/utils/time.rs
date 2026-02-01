@@ -56,6 +56,29 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Estimate the size of a segment in bytes based on media info
+pub fn estimate_segment_size(info: &crate::ffmpeg::MediaInfo, start: f64, end: f64) -> u64 {
+    let segment_duration = (end - start).max(0.0);
+
+    // Try using video_bitrate + audio_bitrate
+    let total_bitrate_bps = match (info.video_bitrate, info.audio_bitrate) {
+        (Some(vbr), Some(abr)) => vbr + abr,
+        (Some(vbr), None) => vbr,
+        (None, Some(abr)) => abr,
+        (None, None) => {
+            // Fallback: estimate from file_size / duration
+            if info.duration > 0.0 {
+                (info.file_size as f64 / info.duration * 8.0) as u64
+            } else {
+                return 0;
+            }
+        }
+    };
+
+    // bitrate is in bits/sec, convert to bytes
+    (total_bitrate_bps as f64 * segment_duration / 8.0) as u64
+}
+
 /// Format bitrate in human-readable format
 pub fn format_bitrate(bps: u64) -> String {
     const KBPS: u64 = 1000;
