@@ -1,11 +1,12 @@
 use std::time::Instant;
 
-/// Playback clock for A/V synchronization
+/// Playback clock for A/V synchronization with variable speed support
 pub struct PlaybackClock {
     start_time: Option<Instant>,
     paused_time: f64,
     offset: f64,
     is_paused: bool,
+    speed: f64,
 }
 
 impl PlaybackClock {
@@ -15,6 +16,7 @@ impl PlaybackClock {
             paused_time: 0.0,
             offset: 0.0,
             is_paused: true,
+            speed: 1.0,
         }
     }
 
@@ -53,20 +55,32 @@ impl PlaybackClock {
         }
     }
 
-    /// Get current playback time in seconds
+    /// Get current playback time in seconds (accounts for speed)
     pub fn get_time(&self) -> f64 {
         if self.is_paused {
             self.paused_time
         } else if let Some(start) = self.start_time {
-            start.elapsed().as_secs_f64() + self.offset
+            start.elapsed().as_secs_f64() * self.speed + self.offset
         } else {
             0.0
         }
     }
 
-    /// Check if clock is paused
-    pub fn is_paused(&self) -> bool {
-        self.is_paused
+    /// Set playback speed (0.25 to 4.0)
+    pub fn set_speed(&mut self, speed: f64) {
+        let new_speed = speed.clamp(0.25, 4.0);
+        if !self.is_paused {
+            // Save current position before changing speed
+            self.paused_time = self.get_time();
+            self.start_time = Some(Instant::now());
+            self.offset = self.paused_time;
+        }
+        self.speed = new_speed;
+    }
+
+    /// Get current speed
+    pub fn get_speed(&self) -> f64 {
+        self.speed
     }
 }
 
@@ -85,7 +99,6 @@ mod tests {
     #[test]
     fn test_clock_basic() {
         let mut clock = PlaybackClock::new();
-        assert!(clock.is_paused());
         assert!((clock.get_time() - 0.0).abs() < 0.001);
 
         clock.resume();
@@ -97,7 +110,7 @@ mod tests {
         let t1 = clock.get_time();
         sleep(Duration::from_millis(50));
         let t2 = clock.get_time();
-        assert!((t1 - t2).abs() < 0.001); // Time should not advance when paused
+        assert!((t1 - t2).abs() < 0.001);
     }
 
     #[test]
@@ -110,5 +123,16 @@ mod tests {
         sleep(Duration::from_millis(100));
         let t = clock.get_time();
         assert!(t >= 10.09 && t <= 10.15);
+    }
+
+    #[test]
+    fn test_clock_speed() {
+        let mut clock = PlaybackClock::new();
+        clock.set_speed(2.0);
+        clock.resume();
+        sleep(Duration::from_millis(100));
+        let t = clock.get_time();
+        // At 2x speed, 100ms real time = ~200ms video time
+        assert!(t >= 0.18 && t <= 0.25);
     }
 }

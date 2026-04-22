@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Mode d'édition principal
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditingMode {
+    /// Découpe de segments
+    Split,
+    /// Assemblage / merge de fichiers
+    Merge,
+}
+
+impl Default for EditingMode {
+    fn default() -> Self {
+        EditingMode::Split
+    }
+}
+
 /// Mode de trim - détermine la vitesse vs précision du cut
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrimMode {

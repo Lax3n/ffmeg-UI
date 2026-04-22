@@ -2,7 +2,7 @@ use crate::export_queue::{JobStatus, SharedQueue, create_shared_queue};
 use crate::ffmpeg::{FFmpegWrapper, SilenceInterval, TaskProgress, compute_cut_points, BitrateMap, extract_bitrate_map, compute_cut_points_accurate};
 use crate::player::{MediaPlayer, PlaybackState};
 use crate::project::{MediaFile, Project};
-use crate::ui::{SplitSegment, SplitSettings, TrimMode};
+use crate::ui::{EditingMode, SplitSegment, SplitSettings, TrimMode};
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -67,6 +67,20 @@ pub struct FFmpegApp {
     pub waveform_peaks: HashMap<PathBuf, Vec<f32>>,
     pub current_waveform: Vec<f32>,
     waveform_loading: Arc<Mutex<Option<(PathBuf, Vec<f32>)>>>,
+
+    // Editing mode
+    pub editing_mode: EditingMode,
+
+    // Thumbnails: raw RGBA data per file (extracted in background)
+    pub thumbnails: HashMap<PathBuf, (Vec<u8>, u32, u32)>,
+    pub thumbnail_textures: HashMap<String, egui::TextureHandle>,
+    thumbnail_loading: Arc<Mutex<Vec<(PathBuf, Vec<u8>, u32, u32)>>>,
+
+    // Playback speed
+    pub playback_speed: f64,
+
+    // Timeline auto-follow playhead
+    pub timeline_follow_playhead: bool,
 }
 
 impl FFmpegApp {
@@ -128,13 +142,39 @@ impl FFmpegApp {
             waveform_peaks: HashMap::new(),
             current_waveform: Vec::new(),
             waveform_loading: Arc::new(Mutex::new(None)),
+
+            // Editing mode
+            editing_mode: EditingMode::Split,
+
+            // Thumbnails
+            thumbnails: HashMap::new(),
+            thumbnail_textures: HashMap::new(),
+            thumbnail_loading: Arc::new(Mutex::new(Vec::new())),
+
+            // Playback speed
+            playback_speed: 1.0,
+
+            // Timeline
+            timeline_follow_playhead: true,
         }
     }
 
     pub fn add_files(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
-            if let Some(media_file) = self.probe_file(&path) {
+        for path in &paths {
+            if let Some(media_file) = self.probe_file(path) {
                 self.project.files.push(media_file);
+            }
+        }
+        // Extract thumbnails in background for new files
+        for path in &paths {
+            if !self.thumbnails.contains_key(path) {
+                let p = path.clone();
+                let slot = self.thumbnail_loading.clone();
+                std::thread::spawn(move || {
+                    if let Some((data, w, h)) = extract_thumbnail_rgba(&p) {
+                        slot.lock().unwrap().push((p, data, w, h));
+                    }
+                });
             }
         }
         if self.selected_file_index.is_none() && !self.project.files.is_empty() {
@@ -142,6 +182,10 @@ impl FFmpegApp {
             self.load_player_for_selected_file();
         }
         self.sync_merge_order();
+        // Auto-switch to Merge mode when 2+ files are loaded
+        if self.project.files.len() >= 2 {
+            self.editing_mode = EditingMode::Merge;
+        }
     }
 
     fn probe_file(&self, path: &PathBuf) -> Option<MediaFile> {
@@ -568,11 +612,10 @@ impl FFmpegApp {
         }
 
         // Both silence detection and bitrate map must be ready
-        let silences_ready = self.auto_cut_silences.lock().unwrap().is_some();
-        let bitrate_ready = self.auto_cut_bitrate_map.lock().unwrap().is_some();
+        let silences_ready = self.auto_cut_silences.lock().map(|g| g.is_some()).unwrap_or(false);
+        let bitrate_ready = self.auto_cut_bitrate_map.lock().map(|g| g.is_some()).unwrap_or(false);
 
         if !silences_ready || !bitrate_ready {
-            // Update status
             if silences_ready {
                 self.auto_cut_status = "Analyzing bitrate...".to_string();
             } else if bitrate_ready {
@@ -581,8 +624,15 @@ impl FFmpegApp {
             return;
         }
 
-        let silences = self.auto_cut_silences.lock().unwrap().take().unwrap();
-        let bitrate_map = self.auto_cut_bitrate_map.lock().unwrap().take().unwrap();
+        // Take results safely (handles race conditions and poisoned locks)
+        let silences = match self.auto_cut_silences.lock().ok().and_then(|mut g| g.take()) {
+            Some(s) => s,
+            None => { self.auto_cut_running = false; return; }
+        };
+        let bitrate_map = match self.auto_cut_bitrate_map.lock().ok().and_then(|mut g| g.take()) {
+            Some(b) => b,
+            None => { self.auto_cut_running = false; return; }
+        };
 
         // Detection is done
         self.auto_cut_running = false;
@@ -756,7 +806,7 @@ impl FFmpegApp {
     /// Poll waveform extraction results (called each frame)
     pub fn poll_waveform(&mut self) {
         let result = {
-            let mut slot = self.waveform_loading.lock().unwrap();
+            let Ok(mut slot) = self.waveform_loading.lock() else { return };
             slot.take()
         };
 
@@ -768,6 +818,115 @@ impl FFmpegApp {
                     self.current_waveform = peaks;
                 }
             }
+        }
+    }
+
+    /// Step forward by one frame (when paused)
+    pub fn frame_step_forward(&mut self) {
+        if let Some(ref player) = self.player {
+            if player.get_state() != PlaybackState::Playing {
+                player.frame_step_forward();
+                self.current_time = player.get_current_time();
+                self.last_frame_pts = -1.0;
+            }
+        }
+    }
+
+    /// Step backward by one frame (when paused)
+    pub fn frame_step_backward(&mut self) {
+        if let Some(ref player) = self.player {
+            if player.get_state() != PlaybackState::Playing {
+                player.frame_step_backward();
+                self.current_time = player.get_current_time();
+                self.last_frame_pts = -1.0;
+            }
+        }
+    }
+
+    /// Set playback speed
+    pub fn set_speed(&mut self, speed: f64) {
+        self.playback_speed = speed.clamp(0.25, 4.0);
+        if let Some(ref mut player) = self.player {
+            player.set_speed(self.playback_speed);
+        }
+    }
+
+    /// Cycle to next speed preset
+    pub fn speed_up(&mut self) {
+        let presets = crate::player::SPEED_PRESETS;
+        let current_idx = presets.iter().position(|&s| (s - self.playback_speed).abs() < 0.01)
+            .unwrap_or(2); // default to 1.0x position
+        let next_idx = (current_idx + 1).min(presets.len() - 1);
+        self.set_speed(presets[next_idx]);
+    }
+
+    /// Cycle to previous speed preset
+    pub fn speed_down(&mut self) {
+        let presets = crate::player::SPEED_PRESETS;
+        let current_idx = presets.iter().position(|&s| (s - self.playback_speed).abs() < 0.01)
+            .unwrap_or(2);
+        let next_idx = if current_idx > 0 { current_idx - 1 } else { 0 };
+        self.set_speed(presets[next_idx]);
+    }
+
+    /// Duplicate selected segment
+    pub fn duplicate_segment(&mut self) {
+        if let Some(idx) = self.selected_segment {
+            if let Some(seg) = self.segments.get(idx).cloned() {
+                self.segments.insert(idx + 1, seg);
+                // Re-label
+                for (i, s) in self.segments.iter_mut().enumerate() {
+                    s.label = format!("Segment {}", i + 1);
+                }
+                self.selected_segment = Some(idx + 1);
+            }
+        }
+    }
+
+    /// Select next segment
+    pub fn select_next_segment(&mut self) {
+        if self.segments.is_empty() { return; }
+        let next = match self.selected_segment {
+            Some(idx) => (idx + 1).min(self.segments.len() - 1),
+            None => 0,
+        };
+        self.selected_segment = Some(next);
+        // Seek to segment start
+        if let Some(seg) = self.segments.get(next) {
+            self.seek(seg.start_time);
+        }
+    }
+
+    /// Select previous segment
+    pub fn select_prev_segment(&mut self) {
+        if self.segments.is_empty() { return; }
+        let prev = match self.selected_segment {
+            Some(idx) => if idx > 0 { idx - 1 } else { 0 },
+            None => 0,
+        };
+        self.selected_segment = Some(prev);
+        if let Some(seg) = self.segments.get(prev) {
+            self.seek(seg.start_time);
+        }
+    }
+
+    /// Clear all segments
+    pub fn clear_all_segments(&mut self) {
+        self.segments.clear();
+        self.selected_segment = None;
+        self.in_point = None;
+        self.out_point = None;
+        self.status_message = "All segments cleared".to_string();
+    }
+
+    /// Poll thumbnail extraction results (called each frame)
+    pub fn poll_thumbnails(&mut self) {
+        let results: Vec<(PathBuf, Vec<u8>, u32, u32)> = {
+            let Ok(mut slot) = self.thumbnail_loading.lock() else { return };
+            std::mem::take(&mut *slot)
+        };
+        for (path, data, w, h) in results {
+            self.thumbnails.insert(path, (data, w, h));
         }
     }
 
@@ -830,7 +989,7 @@ impl FFmpegApp {
             return;
         }
 
-        let completed = self.batch_results.lock().unwrap().len();
+        let completed = self.batch_results.lock().ok().map(|g| g.len()).unwrap_or(0);
         self.batch_status = format!("Analyzing {}/{}...", completed, self.batch_total);
 
         if completed < self.batch_total {
@@ -841,7 +1000,7 @@ impl FFmpegApp {
         self.batch_running = false;
 
         let results: Vec<(usize, Vec<SilenceInterval>)> = {
-            let mut guard = self.batch_results.lock().unwrap();
+            let Ok(mut guard) = self.batch_results.lock() else { return };
             std::mem::take(&mut *guard)
         };
 
@@ -943,7 +1102,7 @@ impl FFmpegApp {
 
             // Queue exports
             {
-                let mut queue = self.export_queue.lock().unwrap();
+                let Ok(mut queue) = self.export_queue.lock() else { return };
                 for (i, seg) in final_segments.iter().enumerate() {
                     let output_path = subfolder.join(format!("{}_{:03}.{}", stem, i + 1, ext));
                     queue.add_trim_with_label(
@@ -1036,7 +1195,7 @@ impl FFmpegApp {
 
         // Add concat job to queue
         {
-            let mut queue = self.export_queue.lock().unwrap();
+            let Ok(mut queue) = self.export_queue.lock() else { return };
             queue.add_concat(
                 inputs,
                 output_path,
@@ -1127,7 +1286,7 @@ impl FFmpegApp {
 
         // Add all segments to queue
         {
-            let mut queue = self.export_queue.lock().unwrap();
+            let Ok(mut queue) = self.export_queue.lock() else { return };
             for (i, seg) in final_segments.iter().enumerate() {
                 let output_path = output_folder.join(format!("{}_{:03}.{}", stem, i + 1, ext));
                 queue.add_trim_with_label(
@@ -1155,7 +1314,7 @@ impl FFmpegApp {
 
         // Check if already processing
         {
-            let q = queue.lock().unwrap();
+            let Ok(q) = queue.lock() else { return };
             if q.is_processing || !q.has_pending() {
                 return;
             }
@@ -1163,7 +1322,7 @@ impl FFmpegApp {
 
         // Get next job
         let job_info = {
-            let mut q = queue.lock().unwrap();
+            let Ok(mut q) = queue.lock() else { return };
             q.is_processing = true;
             if let Some(job) = q.next_pending() {
                 job.status = JobStatus::Running;
@@ -1187,7 +1346,7 @@ impl FFmpegApp {
                     }
                 };
 
-                let mut q = queue.lock().unwrap();
+                let Ok(mut q) = queue.lock() else { return };
                 if let Some(job) = q.get_job_mut(job_id) {
                     match result {
                         Ok(_) => {
@@ -1206,17 +1365,18 @@ impl FFmpegApp {
 
     /// Cancel all pending exports and stop processing
     pub fn cancel_exports(&mut self) {
-        let mut queue = self.export_queue.lock().unwrap();
-        queue.cancel_all();
-        drop(queue);
+        if let Ok(mut queue) = self.export_queue.lock() {
+            queue.cancel_all();
+        }
         self.show_export_progress = false;
         self.status_message = "Exports cancelled".to_string();
     }
 
     /// Clear finished jobs from queue
     pub fn clear_finished_jobs(&mut self) {
-        let mut queue = self.export_queue.lock().unwrap();
-        queue.clear_finished();
+        if let Ok(mut queue) = self.export_queue.lock() {
+            queue.clear_finished();
+        }
     }
 
     /// Update player state and get current frame.
@@ -1247,7 +1407,7 @@ impl FFmpegApp {
             }
 
             if player.get_state() == PlaybackState::Playing {
-                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
     }
@@ -1325,15 +1485,37 @@ impl FFmpegApp {
                 self.toggle_play_pause();
             }
 
-            // Arrow keys - Seek
+            // Arrow keys - Seek (5s) or frame step when paused
             if i.key_pressed(egui::Key::ArrowLeft) {
-                self.seek_relative(-5.0);
+                if self.get_playback_state() == PlaybackState::Playing {
+                    self.seek_relative(-5.0);
+                } else {
+                    self.frame_step_backward();
+                }
             }
             if i.key_pressed(egui::Key::ArrowRight) {
-                self.seek_relative(5.0);
+                if self.get_playback_state() == PlaybackState::Playing {
+                    self.seek_relative(5.0);
+                } else {
+                    self.frame_step_forward();
+                }
             }
 
-            // J/K/L - Playback control
+            // Comma/Period - Frame step (always, like professional NLEs)
+            if i.key_pressed(egui::Key::Comma) {
+                if self.get_playback_state() == PlaybackState::Playing {
+                    self.pause();
+                }
+                self.frame_step_backward();
+            }
+            if i.key_pressed(egui::Key::Period) {
+                if self.get_playback_state() == PlaybackState::Playing {
+                    self.pause();
+                }
+                self.frame_step_forward();
+            }
+
+            // J/K/L - Playback control (NLE standard)
             if i.key_pressed(egui::Key::J) {
                 self.seek_relative(-10.0);
             }
@@ -1372,26 +1554,90 @@ impl FFmpegApp {
                 }
             }
 
+            // D - Duplicate selected segment
+            if i.key_pressed(egui::Key::D) {
+                self.duplicate_segment();
+            }
+
+            // PageUp/PageDown or Ctrl+Arrow - Navigate segments
+            if i.key_pressed(egui::Key::PageDown) {
+                self.select_next_segment();
+            }
+            if i.key_pressed(egui::Key::PageUp) {
+                self.select_prev_segment();
+            }
+
+            // +/- or Ctrl+Up/Down — Speed control
+            if i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl {
+                self.speed_up();
+            }
+            if i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl {
+                self.speed_down();
+            }
+
+            // Backspace - Reset speed to 1x
+            if i.key_pressed(egui::Key::Backspace) {
+                self.set_speed(1.0);
+            }
+
             // Ctrl+E - Export all
             if i.modifiers.ctrl && i.key_pressed(egui::Key::E) {
                 self.export_all();
             }
 
-            // Ctrl+O - Open file
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::O) {
-                // Handled in UI (file dialog needs to be on main thread)
+            // Ctrl+Shift+Delete - Clear all segments
+            if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Delete) {
+                self.clear_all_segments();
+            }
+
+            // Tab - Switch editing mode
+            if i.key_pressed(egui::Key::Tab) && !i.modifiers.ctrl {
+                self.editing_mode = match self.editing_mode {
+                    EditingMode::Split => EditingMode::Merge,
+                    EditingMode::Merge => EditingMode::Split,
+                };
             }
         });
+    }
+
+    /// Handle drag & drop of files into the window
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.add_files(dropped);
+            self.status_message = format!("{} file(s) loaded", self.project.files.len());
+        }
     }
 }
 
 impl eframe::App for FFmpegApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle drag & drop
+        self.handle_dropped_files(ctx);
+
         // Handle keyboard input
         self.handle_input(ctx);
 
         // Update player
         self.update_player(ctx);
+
+        // Auto-follow playhead on timeline
+        if self.timeline_follow_playhead && self.get_playback_state() == PlaybackState::Playing {
+            let duration = self.get_duration();
+            if duration > 0.0 && self.timeline_zoom > 1.0 {
+                let visible_duration = duration / self.timeline_zoom as f64;
+                let scroll_time = self.timeline_scroll as f64 * (duration - visible_duration).max(0.0);
+                // If playhead is outside visible range, scroll to follow
+                if self.current_time < scroll_time || self.current_time > scroll_time + visible_duration {
+                    let target_scroll = ((self.current_time - visible_duration * 0.3) / (duration - visible_duration).max(0.001)) as f32;
+                    self.timeline_scroll = target_scroll.clamp(0.0, 1.0);
+                }
+            }
+        }
 
         // Process export queue
         self.process_queue();
@@ -1404,6 +1650,9 @@ impl eframe::App for FFmpegApp {
 
         // Poll waveform extraction
         self.poll_waveform();
+
+        // Poll thumbnail extraction
+        self.poll_thumbnails();
 
         // Render UI
         crate::ui::render_main_window(self, ctx);
@@ -1418,8 +1667,7 @@ impl eframe::App for FFmpegApp {
         }
 
         // Update export progress status
-        {
-            let queue = self.export_queue.lock().unwrap();
+        if let Ok(queue) = self.export_queue.lock() {
             let (completed, total) = queue.total_progress();
             if total > 0 && self.show_export_progress {
                 let failed_count = queue.jobs.iter()
@@ -1462,6 +1710,42 @@ impl eframe::App for FFmpegApp {
         if needs_repaint {
             ctx.request_repaint();
         }
+    }
+}
+
+/// Extract a thumbnail (first frame) from a video as raw RGBA data.
+/// Returns (rgba_data, width, height) or None on failure.
+fn extract_thumbnail_rgba(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
+    let thumb_w: u32 = 160;
+    let thumb_h: u32 = 90;
+
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-i"])
+        .arg(path)
+        .args([
+            "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2", thumb_w, thumb_h, thumb_w, thumb_h),
+            "-frames:v", "1",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgba",
+            "pipe:1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().ok()?;
+    let expected_size = (thumb_w * thumb_h * 4) as usize;
+    if output.stdout.len() >= expected_size {
+        Some((output.stdout[..expected_size].to_vec(), thumb_w, thumb_h))
+    } else {
+        None
     }
 }
 
