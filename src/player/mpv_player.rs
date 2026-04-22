@@ -313,7 +313,7 @@ fn calculate_preview_size(width: u32, height: u32) -> (u32, u32) {
 
 /// Extract a single frame using FFmpeg (raw video pipe - fast)
 fn extract_frame_raw(path: &PathBuf, time: f64, width: u32, height: u32) -> Result<VideoFrame, String> {
-    let output = std::process::Command::new("ffmpeg")
+    let output = crate::ffmpeg::ffmpeg_command()
         .args(["-ss", &format!("{:.3}", time), "-i"])
         .arg(path)
         .args([

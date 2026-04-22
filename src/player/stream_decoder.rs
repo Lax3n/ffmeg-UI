@@ -10,7 +10,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -117,7 +117,13 @@ impl Drop for StreamDecoder {
 
 /// Spawn FFmpeg for continuous playback (no frame limit)
 fn spawn_ffmpeg_play(path: &PathBuf, start_time: f64, width: u32, height: u32, fps: u32) -> Option<Child> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::ffmpeg::ffmpeg_command();
+    // On Apple Silicon, let VideoToolbox decode H.264/HEVC in hardware.
+    // FFmpeg falls back silently if the codec isn't supported in hardware.
+    #[cfg(target_os = "macos")]
+    {
+        cmd.args(["-hwaccel", "videotoolbox"]);
+    }
     cmd.args(["-ss", &format!("{:.3}", start_time), "-i"])
         .arg(path)
         .args([
@@ -132,18 +138,16 @@ fn spawn_ffmpeg_play(path: &PathBuf, start_time: f64, width: u32, height: u32, f
         .stderr(Stdio::null())
         .stdin(Stdio::null());
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
     cmd.spawn().ok()
 }
 
 /// Spawn FFmpeg for a single frame grab (scrubbing) — ultra fast
 fn spawn_ffmpeg_scrub(path: &PathBuf, time: f64, width: u32, height: u32) -> Option<Child> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::ffmpeg::ffmpeg_command();
+    #[cfg(target_os = "macos")]
+    {
+        cmd.args(["-hwaccel", "videotoolbox"]);
+    }
     cmd.args(["-ss", &format!("{:.3}", time), "-i"])
         .arg(path)
         .args([
@@ -157,12 +161,6 @@ fn spawn_ffmpeg_scrub(path: &PathBuf, time: f64, width: u32, height: u32) -> Opt
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
 
     cmd.spawn().ok()
 }

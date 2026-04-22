@@ -1,4 +1,5 @@
 use super::commands::*;
+use super::paths::{apply_platform_flags_tokio, ffmpeg_path, ffprobe_path, install_hint};
 use super::probe::{probe_file, MediaInfo};
 use super::silence::{build_silence_detect_args, parse_silence_output, SilenceInterval};
 use crate::ui::TrimMode;
@@ -17,8 +18,8 @@ pub struct FFmpegWrapper {
 impl FFmpegWrapper {
     pub fn new() -> Self {
         Self {
-            ffmpeg_path: "ffmpeg".to_string(),
-            ffprobe_path: "ffprobe".to_string(),
+            ffmpeg_path: ffmpeg_path().to_string(),
+            ffprobe_path: ffprobe_path().to_string(),
         }
     }
 
@@ -65,15 +66,10 @@ impl FFmpegWrapper {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // On Windows GUI apps, prevent FFmpeg from creating a console window
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        apply_platform_flags_tokio(&mut cmd);
 
         let mut child = cmd.spawn()
-            .map_err(|e| anyhow!("Failed to start FFmpeg: {}. Is FFmpeg installed and in PATH?", e))?;
+            .map_err(|e| anyhow!("Impossible de lancer FFmpeg: {}. {}", e, install_hint()))?;
 
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to capture stderr"))?;
         let mut reader = BufReader::new(stderr).lines();
@@ -115,16 +111,13 @@ impl FFmpegWrapper {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        apply_platform_flags_tokio(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| {
             anyhow!(
-                "Failed to start FFmpeg for silence detection: {}. Is FFmpeg installed and in PATH?",
-                e
+                "Impossible de lancer FFmpeg pour la détection de silence: {}. {}",
+                e,
+                install_hint()
             )
         })?;
 

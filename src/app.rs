@@ -1,5 +1,5 @@
 use crate::export_queue::{JobStatus, SharedQueue, create_shared_queue};
-use crate::ffmpeg::{FFmpegWrapper, SilenceInterval, TaskProgress, compute_cut_points, BitrateMap, extract_bitrate_map, compute_cut_points_accurate};
+use crate::ffmpeg::{FFmpegWrapper, SilenceInterval, TaskProgress, compute_cut_points, BitrateMap, extract_bitrate_map, compute_cut_points_accurate, ffmpeg_command};
 use crate::player::{MediaPlayer, PlaybackState};
 use crate::project::{MediaFile, Project};
 use crate::ui::{EditingMode, SplitSegment, SplitSettings, TrimMode};
@@ -1448,7 +1448,35 @@ impl FFmpegApp {
                     .spawn();
             }
 
-            #[cfg(unix)]
+            #[cfg(target_os = "macos")]
+            {
+                // Preferred: `open -a LosslessCut <file>` (handles .app bundles + Gatekeeper)
+                if std::process::Command::new("open")
+                    .args(["-a", "LosslessCut"])
+                    .arg(&path)
+                    .spawn()
+                    .is_ok()
+                {
+                    return;
+                }
+
+                // Fallback: direct binary inside a .app bundle (Homebrew Cask or manual install)
+                let bundle_paths = [
+                    "/Applications/LosslessCut.app/Contents/MacOS/LosslessCut",
+                    "/Applications/Utilities/LosslessCut.app/Contents/MacOS/LosslessCut",
+                ];
+                for exe in bundle_paths {
+                    if std::path::Path::new(exe).exists() {
+                        let _ = std::process::Command::new(exe).arg(&path).spawn();
+                        return;
+                    }
+                }
+
+                // Last resort: CLI if installed via npm / brew
+                let _ = std::process::Command::new("losslesscut").arg(&path).spawn();
+            }
+
+            #[cfg(all(unix, not(target_os = "macos")))]
             {
                 let _ = std::process::Command::new("losslesscut")
                     .arg(&path)
@@ -1719,7 +1747,7 @@ fn extract_thumbnail_rgba(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
     let thumb_w: u32 = 160;
     let thumb_h: u32 = 90;
 
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = ffmpeg_command();
     cmd.args(["-i"])
         .arg(path)
         .args([
@@ -1733,13 +1761,6 @@ fn extract_thumbnail_rgba(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null());
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
     let output = cmd.output().ok()?;
     let expected_size = (thumb_w * thumb_h * 4) as usize;
     if output.stdout.len() >= expected_size {
@@ -1752,20 +1773,13 @@ fn extract_thumbnail_rgba(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
 /// Extract audio waveform peaks using FFmpeg at 1kHz sample rate.
 /// Returns absolute amplitude values (one per millisecond).
 fn extract_waveform_peaks(path: &PathBuf) -> Vec<f32> {
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = ffmpeg_command();
     cmd.arg("-i")
         .arg(path)
         .args(["-ac", "1", "-ar", "1000", "-f", "f32le", "-vn", "pipe:1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     let output = match cmd.output() {
         Ok(o) => o,

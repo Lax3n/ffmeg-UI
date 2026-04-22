@@ -1,0 +1,8 @@
+# Optimise les builds release pour le CPU hôte.
+# Sur Apple Silicon (M1/M2/M3/M4/M5), active l'ensemble des extensions arm64
+# (NEON, crypto, dot-product, etc.) pour un binaire ciblé.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]

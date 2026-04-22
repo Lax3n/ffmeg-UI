@@ -126,7 +126,7 @@ fn extract_audio_to_temp(video_path: &PathBuf) -> Result<PathBuf, String> {
 
     let _ = std::fs::remove_file(&temp_path);
 
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = crate::ffmpeg::ffmpeg_command();
     cmd.args(["-y", "-i"])
         .arg(video_path)
         .args([
@@ -138,13 +138,6 @@ fn extract_audio_to_temp(video_path: &PathBuf) -> Result<PathBuf, String> {
         .arg(&temp_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     let output = cmd.output()
         .map_err(|e| format!("Failed to run FFmpeg: {}", e))?;

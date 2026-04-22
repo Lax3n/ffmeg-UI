@@ -1,7 +1,8 @@
 /// Silence detection, bitrate mapping, and intelligent cut-point computation.
 
+use super::paths::ffprobe_command;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// A detected silence interval from FFmpeg's silencedetect filter.
 #[derive(Debug, Clone)]
@@ -188,7 +189,7 @@ impl BitrateMap {
 /// Groups packet sizes by second to build a cumulative byte curve.
 /// This gives accurate size data even for variable bitrate content.
 pub fn extract_bitrate_map(path: &Path, duration: f64) -> BitrateMap {
-    let mut cmd = Command::new("ffprobe");
+    let mut cmd = ffprobe_command();
     cmd.args([
         "-v", "quiet",
         "-select_streams", "v:0",
@@ -199,13 +200,6 @@ pub fn extract_bitrate_map(path: &Path, duration: f64) -> BitrateMap {
     .stdout(Stdio::piped())
     .stderr(Stdio::null())
     .stdin(Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     let output = match cmd.output() {
         Ok(o) => o,
@@ -242,7 +236,7 @@ pub fn extract_bitrate_map(path: &Path, duration: f64) -> BitrateMap {
     }
 
     // Also account for audio stream sizes
-    let mut cmd_audio = Command::new("ffprobe");
+    let mut cmd_audio = ffprobe_command();
     cmd_audio.args([
         "-v", "quiet",
         "-select_streams", "a:0",
@@ -253,13 +247,6 @@ pub fn extract_bitrate_map(path: &Path, duration: f64) -> BitrateMap {
     .stdout(Stdio::piped())
     .stderr(Stdio::null())
     .stdin(Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd_audio.creation_flags(CREATE_NO_WINDOW);
-    }
 
     if let Ok(audio_output) = cmd_audio.output() {
         let audio_stdout = String::from_utf8_lossy(&audio_output.stdout);

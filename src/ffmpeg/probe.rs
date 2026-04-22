@@ -1,7 +1,7 @@
+use super::paths::{ffmpeg_command, ffprobe_command};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MediaInfo {
@@ -46,7 +46,7 @@ struct FFProbeStream {
 }
 
 pub fn probe_file(path: &Path) -> Result<MediaInfo> {
-    let output = Command::new("ffprobe")
+    let output = ffprobe_command()
         .args([
             "-v", "quiet",
             "-print_format", "json",
@@ -54,7 +54,12 @@ pub fn probe_file(path: &Path) -> Result<MediaInfo> {
             "-show_streams",
         ])
         .arg(path)
-        .output()?;
+        .output()
+        .map_err(|e| anyhow!(
+            "ffprobe a échoué: {}. {}",
+            e,
+            super::paths::install_hint()
+        ))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -123,7 +128,7 @@ fn parse_framerate(fps_str: &str) -> Option<f64> {
 
 /// Extract a thumbnail frame from a video at a specific timestamp
 pub fn extract_frame(video_path: &Path, output_path: &Path, timestamp: f64) -> Result<()> {
-    let output = Command::new("ffmpeg")
+    let output = ffmpeg_command()
         .args([
             "-y",
             "-ss", &timestamp.to_string(),
@@ -135,7 +140,8 @@ pub fn extract_frame(video_path: &Path, output_path: &Path, timestamp: f64) -> R
             "-q:v", "2",
         ])
         .arg(output_path)
-        .output()?;
+        .output()
+        .map_err(|e| anyhow!("ffmpeg a échoué: {}. {}", e, super::paths::install_hint()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
