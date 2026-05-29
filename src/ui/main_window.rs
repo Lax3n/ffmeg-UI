@@ -1,6 +1,6 @@
 use crate::app::FFmpegApp;
 use crate::player::PlaybackState;
-use crate::ui::{EditingMode, TimelineWidget, TrimMode};
+use crate::ui::{EditingMode, TimelineClip, TimelineWidget, TrimMode};
 use crate::utils::{format_time, format_size};
 use eframe::egui;
 
@@ -429,6 +429,13 @@ fn render_mode_tabs(app: &mut FFmpegApp, ui: &mut egui::Ui) {
 }
 
 fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    // En mode Merge avec au moins 2 fichiers, la timeline affiche tous les clips
+    // à fusionner bout à bout sur la durée totale, plutôt que les segments d'un fichier.
+    if app.editing_mode == EditingMode::Merge && app.project.files.len() >= 2 {
+        render_merge_timeline(app, ui);
+        return;
+    }
+
     let duration = app.get_duration();
 
     let response = TimelineWidget::new(duration, app.current_time)
@@ -452,6 +459,78 @@ fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     }
     if let Some(idx) = response.segment_clicked {
         app.selected_segment = Some(idx);
+    }
+    if response.is_scrubbing {
+        ui.ctx().request_repaint();
+    }
+    if response.zoom_to_fit {
+        app.timeline_zoom = 1.0;
+        app.timeline_scroll = 0.0;
+    }
+}
+
+/// Timeline du mode Merge : les fichiers à fusionner sont posés bout à bout,
+/// chacun proportionnel à sa durée, sur la durée totale du merge.
+fn render_merge_timeline(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    // Ordre effectif des fichiers (merge_file_order s'il est défini, sinon ordre naturel).
+    let order: Vec<usize> = if app.merge_file_order.is_empty() {
+        (0..app.project.files.len()).collect()
+    } else {
+        app.merge_file_order
+            .iter()
+            .copied()
+            .filter(|&i| i < app.project.files.len())
+            .collect()
+    };
+
+    let mut clips = Vec::with_capacity(order.len());
+    let mut total = 0.0;
+    let mut playhead_offset = 0.0;
+    for &idx in &order {
+        let file = &app.project.files[idx];
+        let dur = file.info.duration.max(0.0);
+        let is_current = app.selected_file_index == Some(idx);
+        if is_current {
+            playhead_offset = total;
+        }
+        clips.push(TimelineClip {
+            label: file.filename(),
+            duration: dur,
+            is_current,
+        });
+        total += dur;
+    }
+
+    // Le playhead global = position du fichier courant + temps de lecture local.
+    let global_current = playhead_offset + app.current_time;
+
+    let response = TimelineWidget::new(total, global_current)
+        .zoom(app.timeline_zoom)
+        .scroll(app.timeline_scroll)
+        .clips(&clips)
+        .show(ui);
+
+    // Un clic sélectionne le fichier survolé et seek à la position locale correspondante.
+    if let Some(t) = response.seek_to {
+        let mut acc = 0.0;
+        for (pos, &idx) in order.iter().enumerate() {
+            let dur = app.project.files[idx].info.duration.max(0.0);
+            let is_last = pos + 1 == order.len();
+            if t < acc + dur || is_last {
+                if app.selected_file_index != Some(idx) {
+                    app.select_file(idx);
+                }
+                app.seek((t - acc).clamp(0.0, dur));
+                break;
+            }
+            acc += dur;
+        }
+    }
+    if let Some(zoom) = response.zoom_changed {
+        app.timeline_zoom = zoom;
+    }
+    if let Some(scroll) = response.scroll_changed {
+        app.timeline_scroll = scroll;
     }
     if response.is_scrubbing {
         ui.ctx().request_repaint();

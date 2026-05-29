@@ -14,6 +14,14 @@ const SEGMENT_COLORS: [(u8, u8, u8); 8] = [
     (149, 237, 100),  // lime
 ];
 
+/// Un clip affiché bout à bout sur la timeline en mode Merge (un fichier à concaténer).
+pub struct TimelineClip {
+    pub label: String,
+    pub duration: f64,
+    /// `true` si ce clip correspond au fichier actuellement sélectionné/prévisualisé.
+    pub is_current: bool,
+}
+
 /// Timeline widget with waveform visualization and multi-segment support
 pub struct TimelineWidget<'a> {
     pub duration: f64,
@@ -25,6 +33,8 @@ pub struct TimelineWidget<'a> {
     pub segments: &'a [SplitSegment],
     pub selected_segment: Option<usize>,
     pub waveform_data: &'a [f32],
+    /// Clips à fusionner (mode Merge). Si non vide, ils remplacent l'affichage des segments.
+    pub clips: &'a [TimelineClip],
 }
 
 impl<'a> TimelineWidget<'a> {
@@ -39,6 +49,7 @@ impl<'a> TimelineWidget<'a> {
             segments: &[],
             selected_segment: None,
             waveform_data: &[],
+            clips: &[],
         }
     }
 
@@ -74,6 +85,11 @@ impl<'a> TimelineWidget<'a> {
 
     pub fn waveform_data(mut self, data: &'a [f32]) -> Self {
         self.waveform_data = data;
+        self
+    }
+
+    pub fn clips(mut self, clips: &'a [TimelineClip]) -> Self {
+        self.clips = clips;
         self
     }
 
@@ -153,7 +169,11 @@ impl<'a> TimelineWidget<'a> {
             self.draw_waveform(&painter, waveform_rect, scroll_time, visible_duration);
 
             painter.rect_filled(track_rect, 2.0, egui::Color32::from_gray(40));
-            self.draw_segments(&painter, track_rect, scroll_time, visible_duration);
+            if self.clips.is_empty() {
+                self.draw_segments(&painter, track_rect, scroll_time, visible_duration);
+            } else {
+                self.draw_clips(&painter, track_rect, scroll_time, visible_duration);
+            }
             self.draw_working_markers(&painter, rect, scroll_time, visible_duration);
             self.draw_playhead(&painter, rect, scroll_time, visible_duration);
 
@@ -325,6 +345,56 @@ impl<'a> TimelineWidget<'a> {
                     egui::Align2::LEFT_TOP,
                     &seg.label,
                     egui::FontId::proportional(9.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    /// Dessine les clips à fusionner bout à bout : chaque clip occupe une largeur
+    /// proportionnelle à sa durée sur la durée totale du merge.
+    fn draw_clips(&self, painter: &egui::Painter, rect: egui::Rect, scroll_time: f64, visible_duration: f64) {
+        let pixels_per_second = rect.width() / visible_duration as f32;
+        let mut offset = 0.0f64;
+
+        for (i, clip) in self.clips.iter().enumerate() {
+            let start = offset;
+            let end = offset + clip.duration.max(0.0);
+            offset = end;
+
+            let start_x = rect.left() + ((start - scroll_time) as f32 * pixels_per_second);
+            let end_x = rect.left() + ((end - scroll_time) as f32 * pixels_per_second);
+
+            if start_x > rect.right() || end_x < rect.left() {
+                continue;
+            }
+
+            let (r, g, b) = SEGMENT_COLORS[i % SEGMENT_COLORS.len()];
+            let alpha = if clip.is_current { 150 } else { 90 };
+
+            let clip_rect = egui::Rect::from_min_max(
+                egui::pos2(start_x.max(rect.left()), rect.top()),
+                egui::pos2(end_x.min(rect.right()), rect.bottom()),
+            );
+
+            painter.rect_filled(clip_rect, 2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, alpha));
+
+            // Bordure : marquée pour le clip courant, fine séparation sinon.
+            let stroke = if clip.is_current {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(r, g, b))
+            } else {
+                egui::Stroke::new(1.0, egui::Color32::from_gray(20))
+            };
+            painter.rect_stroke(clip_rect, 2.0, stroke);
+
+            // Label « N. nom (durée) » si la largeur le permet.
+            if clip_rect.width() > 30.0 {
+                let text = format!("{}. {} ({})", i + 1, clip.label, format_time(clip.duration));
+                painter.text(
+                    egui::pos2(clip_rect.left() + 4.0, clip_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    egui::FontId::proportional(10.0),
                     egui::Color32::WHITE,
                 );
             }
