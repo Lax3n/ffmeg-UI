@@ -195,9 +195,7 @@ impl FFmpegWrapper {
             let mut f = std::fs::File::create(&list_path)
                 .map_err(|e| anyhow!("Failed to create concat list: {}", e))?;
             for input in inputs {
-                // Use forward slashes and escape single quotes for FFmpeg
-                let path_str = input.to_string_lossy().replace('\\', "/");
-                writeln!(f, "file '{}'", path_str.replace('\'', "'\\''"))
+                writeln!(f, "{}", concat_demuxer_line(input))
                     .map_err(|e| anyhow!("Failed to write concat list: {}", e))?;
             }
         }

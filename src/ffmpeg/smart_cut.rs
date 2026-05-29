@@ -12,6 +12,7 @@
 //! Si l'ensemble du segment ne contient aucune keyframe ou est trop court pour
 //! avoir un Middle, on ré-encode le tout (rare en pratique).
 
+use super::commands::concat_demuxer_line;
 use super::keyframes::{first_keyframe_at_or_after, last_keyframe_at_or_before};
 use super::paths::{apply_platform_flags_tokio, ffmpeg_path, install_hint};
 use anyhow::{anyhow, Result};
@@ -333,9 +334,7 @@ async fn concat_ts_fragments(
         let mut f = std::fs::File::create(&list_path)
             .map_err(|e| anyhow!("Cannot create concat list: {}", e))?;
         for ts_path in ts_paths {
-            // Échappe les apostrophes dans le chemin
-            let path_str = ts_path.to_string_lossy().replace('\'', "'\\''");
-            writeln!(f, "file '{}'", path_str)
+            writeln!(f, "{}", concat_demuxer_line(ts_path))
                 .map_err(|e| anyhow!("Cannot write concat list: {}", e))?;
         }
     }
