@@ -1,9 +1,10 @@
 //! Resolve ffmpeg / ffprobe binaries across platforms.
 //!
-//! GUI apps launched from Finder on macOS do not inherit the user's shell PATH,
-//! so `Command::new("ffmpeg")` fails with ENOENT even when Homebrew has it
-//! installed. We search the common install prefixes ourselves, giving
-//! Apple Silicon Homebrew priority.
+//! GUI apps launched from Finder (macOS) or the Explorer (Windows) do not
+//! inherit the user's shell PATH, so `Command::new("ffmpeg")` can fail with
+//! ENOENT even when ffmpeg is installed. We search the common install prefixes
+//! ourselves (Homebrew on macOS, winget/chocolatey/scoop on Windows), and we
+//! always look next to our own executable first so a bundled ffmpeg wins.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -30,6 +31,52 @@ const UNIX_CANDIDATE_DIRS: &[&str] = &[
     "/snap/bin",
 ];
 
+/// File name of a binary including the platform executable suffix
+/// (`ffmpeg` on Unix, `ffmpeg.exe` on Windows).
+fn exe_name(binary: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{binary}.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        binary.to_string()
+    }
+}
+
+/// Candidate full paths searched on Windows, in order of preference.
+/// Covers winget, Chocolatey, Scoop and common manual install locations.
+/// Most of these are derived from environment variables that exist on the
+/// machine being run, so unset ones are simply skipped.
+#[cfg(target_os = "windows")]
+fn windows_candidate_paths(binary: &str) -> Vec<PathBuf> {
+    let exe = exe_name(binary);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // winget shims (Gyan.FFmpeg and friends register their bin dir here)
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(&local).join(r"Microsoft\WinGet\Links"));
+    }
+    // Chocolatey
+    if let Ok(program_data) = std::env::var("ProgramData") {
+        dirs.push(PathBuf::from(&program_data).join(r"chocolatey\bin"));
+    }
+    // Scoop (per-user install)
+    if let Ok(user) = std::env::var("USERPROFILE") {
+        dirs.push(PathBuf::from(&user).join(r"scoop\shims"));
+    }
+    // Manual installs unpacked under Program Files
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(pf) = std::env::var(var) {
+            dirs.push(PathBuf::from(&pf).join(r"ffmpeg\bin"));
+        }
+    }
+    // Classic "extract to C:\ffmpeg" convention
+    dirs.push(PathBuf::from(r"C:\ffmpeg\bin"));
+
+    dirs.into_iter().map(|dir| dir.join(&exe)).collect()
+}
+
 fn resolve(binary: &str) -> String {
     // 1. Explicit override via environment variable
     let env_key = if binary == "ffmpeg" { "FFMPEG_BIN" } else { "FFPROBE_BIN" };
@@ -39,7 +86,17 @@ fn resolve(binary: &str) -> String {
         }
     }
 
-    // 2. Platform-specific well-known locations
+    // 2. Next to our own executable (a bundled ffmpeg ships alongside the app)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(exe_name(binary));
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    // 3. Platform-specific well-known locations
     #[cfg(target_os = "macos")]
     {
         for dir in MACOS_CANDIDATE_DIRS {
@@ -60,7 +117,17 @@ fn resolve(binary: &str) -> String {
         }
     }
 
-    // 3. Fall back to bare name (relies on PATH)
+    #[cfg(target_os = "windows")]
+    {
+        for candidate in windows_candidate_paths(binary) {
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    // 4. Fall back to bare name. On Windows the OS appends ".exe" itself when
+    //    searching PATH, so the bare name still resolves there.
     binary.to_string()
 }
 

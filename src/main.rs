@@ -12,6 +12,10 @@ use app::FFmpegApp;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // Charge un éventuel fichier .env (ex: FFMPEG_BIN / FFPROBE_BIN) avant que
+    // la résolution des binaires ffmpeg ne lise l'environnement. Absent = ignoré.
+    let _ = dotenvy::dotenv();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

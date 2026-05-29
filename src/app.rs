@@ -1491,10 +1491,10 @@ impl FFmpegApp {
             let path = file.path.clone();
             let start_time = self.current_time;
 
-            let _ = std::process::Command::new("mpv")
-                .arg(format!("--start={}", start_time))
-                .arg(&path)
-                .spawn();
+            let mut cmd = std::process::Command::new("mpv");
+            cmd.arg(format!("--start={}", start_time)).arg(&path);
+            crate::ffmpeg::apply_platform_flags(&mut cmd);
+            let _ = cmd.spawn();
         }
     }
 

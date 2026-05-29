@@ -19,6 +19,9 @@ tmpclaude-*
 Thumbs.db
 desktop.ini
 
+# Local environment (chemins ffmpeg perso) — .env.example reste versionné
+.env
+
 # Temporary files
 *.tmp
 *.temp

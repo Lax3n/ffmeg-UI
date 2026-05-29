@@ -20,6 +20,9 @@ anyhow = "1.0"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 
+# Charge les variables depuis un fichier .env (ex: FFMPEG_BIN / FFPROBE_BIN)
+dotenvy = "0.15"
+
 # Audio playback
 rodio = "0.19"
 

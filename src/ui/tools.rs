@@ -20,8 +20,12 @@ impl Default for EditingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrimMode {
     /// Lossless: -c copy, coupe aux keyframes (~instantané)
-    #[default]
     Lossless,
+    /// Smart-cut: copy le plus possible, ré-encode uniquement
+    /// les bouts hors keyframes pour atteindre la précision frame.
+    /// Sortie sans décalage entre segments adjacents.
+    #[default]
+    SmartCut,
     /// Précis avec ré-encodage ultrafast (quelques secondes)
     Precise,
     /// Ré-encodage complet haute qualité (plus lent)
@@ -30,12 +34,18 @@ pub enum TrimMode {
 
 impl TrimMode {
     pub fn all() -> &'static [TrimMode] {
-        &[TrimMode::Lossless, TrimMode::Precise, TrimMode::HighQuality]
+        &[
+            TrimMode::SmartCut,
+            TrimMode::Lossless,
+            TrimMode::Precise,
+            TrimMode::HighQuality,
+        ]
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             TrimMode::Lossless => "Lossless (instantané)",
+            TrimMode::SmartCut => "Smart-Cut (frame-précis)",
             TrimMode::Precise => "Précis (rapide)",
             TrimMode::HighQuality => "Haute qualité (lent)",
         }
@@ -44,6 +54,7 @@ impl TrimMode {
     pub fn description(&self) -> &'static str {
         match self {
             TrimMode::Lossless => "Coupe aux keyframes, pas de ré-encodage (~1 sec)",
+            TrimMode::SmartCut => "Coupe à la frame près, ré-encode uniquement les bouts (~3-5 sec)",
             TrimMode::Precise => "Ré-encode en ultrafast, coupe précise (~10 sec)",
             TrimMode::HighQuality => "Ré-encode complet, qualité maximale (~1 min+)",
         }
@@ -64,7 +75,7 @@ impl Default for TrimSettings {
         Self {
             start_time: 0.0,
             end_time: 10.0,
-            mode: TrimMode::Lossless,
+            mode: TrimMode::SmartCut,
             start_time_str: "00:00.000".to_string(),
             end_time_str: "00:10.000".to_string(),
         }
@@ -115,7 +126,7 @@ pub struct SplitSettings {
 impl Default for SplitSettings {
     fn default() -> Self {
         Self {
-            trim_mode: TrimMode::Lossless,
+            trim_mode: TrimMode::SmartCut,
             max_size_mb: 1000.0, // défaut 1000 MB pour Auto-Cut
             output_folder: None,
         }

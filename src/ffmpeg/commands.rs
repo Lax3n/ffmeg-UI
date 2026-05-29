@@ -13,6 +13,12 @@ pub fn build_trim_args(
     let duration = end - start;
 
     match mode {
+        TrimMode::SmartCut => {
+            // SmartCut a un pipeline multi-étapes (fragments + concat) qui ne
+            // tient pas dans un seul appel ffmpeg. Le wrapper l'intercepte avant
+            // d'arriver ici. Cette branche ne devrait donc jamais s'exécuter.
+            unreachable!("SmartCut doit être routé via FFmpegWrapper::smart_trim, pas build_trim_args")
+        }
         TrimMode::Lossless => {
             // -c copy: pas de ré-encodage, coupe aux keyframes (~instantané)
             // Pas besoin de threads ici, c'est juste du copy

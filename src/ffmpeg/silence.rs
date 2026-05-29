@@ -1,8 +1,15 @@
 /// Silence detection, bitrate mapping, and intelligent cut-point computation.
 
 use super::paths::ffprobe_command;
+use std::cmp::Ordering;
 use std::path::Path;
 use std::process::Stdio;
+
+/// Asymétrie de la fenêtre de recherche : on préfère minimiser le segment
+/// (couper avant `ideal_end`) plutôt que le maximiser. Côté droit limité à
+/// 25 % de la tolérance — un silence après `ideal_end` doit donc être très
+/// proche pour être considéré.
+const RIGHT_WINDOW_RATIO: f64 = 0.25;
 
 /// A detected silence interval from FFmpeg's silencedetect filter.
 #[derive(Debug, Clone)]
@@ -15,6 +22,61 @@ impl SilenceInterval {
     pub fn midpoint(&self) -> f64 {
         (self.start + self.end) / 2.0
     }
+
+    pub fn duration(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+}
+
+/// Trie les silences candidats par ordre de préférence pour servir de point de coupe.
+///
+/// Critères, dans l'ordre :
+/// 1. **Durée DESC** : le plus gros silence d'abord ("plus gros blanc")
+/// 2. **Distance ASC** : le plus proche de `ideal_end`
+/// 3. **Position : avant gagne** : à distance identique, on préfère le silence
+///    *avant* `ideal_end` car on veut minimiser le segment plutôt que le maximiser
+///
+/// Filtre d'abord ceux dont le midpoint est hors de la fenêtre
+/// `[window_start, window_end]`.
+fn rank_candidates<'a>(
+    silences: &'a [SilenceInterval],
+    window_start: f64,
+    window_end: f64,
+    ideal_end: f64,
+) -> Vec<&'a SilenceInterval> {
+    let mut candidates: Vec<&SilenceInterval> = silences
+        .iter()
+        .filter(|s| s.midpoint() >= window_start && s.midpoint() <= window_end)
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        // 1. Durée DESC ("plus gros blanc")
+        let cmp_dur = b
+            .duration()
+            .partial_cmp(&a.duration())
+            .unwrap_or(Ordering::Equal);
+        if cmp_dur != Ordering::Equal {
+            return cmp_dur;
+        }
+        // 2. Distance ASC ("le plus proche")
+        let dist_a = (a.midpoint() - ideal_end).abs();
+        let dist_b = (b.midpoint() - ideal_end).abs();
+        let cmp_dist = dist_a.partial_cmp(&dist_b).unwrap_or(Ordering::Equal);
+        if cmp_dist != Ordering::Equal {
+            return cmp_dist;
+        }
+        // 3. À distance identique : préférer AVANT ideal_end (minimiser le segment).
+        //    `a` avant et `b` après → a gagne (Less).
+        let a_before = a.midpoint() <= ideal_end;
+        let b_before = b.midpoint() <= ideal_end;
+        match (a_before, b_before) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        }
+    });
+
+    candidates
 }
 
 /// Build FFmpeg arguments for silence detection.
@@ -115,30 +177,26 @@ pub fn compute_cut_points(
             break;
         }
 
-        // Search for the best silence to cut at within ±tolerance of ideal_end
+        // Fenêtre asymétrique : on préfère minimiser le segment, donc on
+        // cherche surtout AVANT ideal_end. Côté droit limité à 25 % de la
+        // tolérance pour ne capter qu'un silence très proche après ideal_end.
         let window_start = (ideal_end - tolerance_secs).max(cursor + 1.0);
-        let window_end = (ideal_end + tolerance_secs).min(duration);
+        let window_end = (ideal_end + tolerance_secs * RIGHT_WINDOW_RATIO).min(duration);
+        let candidates = rank_candidates(silences, window_start, window_end, ideal_end);
 
-        let best_silence = silences
+        // On itère du plus long au plus court : premier qui ne fait pas dépasser
+        // `max_duration` depuis cursor → on coupe à son midpoint.
+        let cut_point = candidates
             .iter()
-            .filter(|s| s.midpoint() >= window_start && s.midpoint() <= window_end)
-            .min_by(|a, b| {
-                let dist_a = (a.midpoint() - ideal_end).abs();
-                let dist_b = (b.midpoint() - ideal_end).abs();
-                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-        let cut_point = if let Some(silence) = best_silence {
-            // Cut at midpoint of the silence interval, but don't exceed max_duration from cursor
-            let mid = silence.midpoint();
-            if mid - cursor <= max_duration {
-                mid
-            } else {
-                ideal_end
-            }
-        } else {
-            ideal_end
-        };
+            .find_map(|s| {
+                let mid = s.midpoint();
+                if mid - cursor <= max_duration {
+                    Some(mid)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(ideal_end);
 
         segments.push((cursor, cut_point));
         cursor = cut_point;
@@ -320,31 +378,27 @@ pub fn compute_cut_points_accurate(
             break;
         }
 
-        // Search for the best silence to cut at within ±tolerance of ideal_end
+        // Fenêtre asymétrique : on préfère minimiser le segment, donc on
+        // cherche surtout AVANT ideal_end. Côté droit limité à 25 % de la
+        // tolérance pour ne capter qu'un silence très proche après ideal_end.
         let window_start = (ideal_end - tolerance_secs).max(cursor + 1.0);
-        let window_end = (ideal_end + tolerance_secs).min(duration);
+        let window_end = (ideal_end + tolerance_secs * RIGHT_WINDOW_RATIO).min(duration);
+        let candidates = rank_candidates(silences, window_start, window_end, ideal_end);
 
-        let best_silence = silences
+        // On itère du plus long au plus court : premier qui respecte le budget
+        // `effective_max_bytes` depuis cursor → on coupe à son midpoint.
+        let cut_point = candidates
             .iter()
-            .filter(|s| s.midpoint() >= window_start && s.midpoint() <= window_end)
-            .min_by(|a, b| {
-                let dist_a = (a.midpoint() - ideal_end).abs();
-                let dist_b = (b.midpoint() - ideal_end).abs();
-                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-        let cut_point = if let Some(silence) = best_silence {
-            let mid = silence.midpoint();
-            // Verify that cutting here doesn't exceed max bytes
-            let bytes = bitrate_map.bytes_between(cursor, mid);
-            if bytes <= effective_max_bytes {
-                mid
-            } else {
-                ideal_end
-            }
-        } else {
-            ideal_end
-        };
+            .find_map(|s| {
+                let mid = s.midpoint();
+                let bytes = bitrate_map.bytes_between(cursor, mid);
+                if bytes <= effective_max_bytes {
+                    Some(mid)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(ideal_end);
 
         // Safety: ensure we advance at least 1 second
         let cut_point = if cut_point <= cursor + 0.5 {
@@ -408,6 +462,69 @@ mod tests {
         }
         // Last segment should end at duration
         assert!((segments.last().unwrap().1 - 600.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_prefers_longest_silence_before_ideal_end() {
+        // 600s à 8 Mbps = 600 MB, max = 200 MB → coupe idéale ≈ 196s.
+        // Fenêtre asymétrique : [166s, 196 + 30*0.25 = 203.5s]
+        // Deux silences candidats, tous deux AVANT ideal_end :
+        //   - 193.5..194.0 (durée 0.5s, midpoint 193.75)
+        //   - 174.0..179.0 (durée 5.0s, midpoint 176.5)
+        // Le plus long doit être préféré, même s'il est plus loin.
+        let silences = vec![
+            SilenceInterval { start: 193.5, end: 194.0 },
+            SilenceInterval { start: 174.0, end: 179.0 },
+        ];
+
+        let segments = compute_cut_points(600.0, 8_000_000.0, 200_000_000, 30.0, &silences);
+
+        assert!(
+            (segments[0].1 - 176.5).abs() < 0.5,
+            "Premier cut attendu ≈ 176.5s (gros silence), obtenu {}",
+            segments[0].1
+        );
+    }
+
+    #[test]
+    fn test_excludes_silence_too_far_after_ideal_end() {
+        // Avec la fenêtre asymétrique (25 % à droite), un silence à +20s après
+        // ideal_end est HORS fenêtre. Seul un silence avant doit être retenu.
+        // ideal_end ≈ 196s, window_end ≈ 203.5s.
+        let silences = vec![
+            SilenceInterval { start: 215.0, end: 220.0 }, // gros silence MAIS hors fenêtre
+            SilenceInterval { start: 190.0, end: 191.0 }, // petit silence dans la fenêtre
+        ];
+
+        let segments = compute_cut_points(600.0, 8_000_000.0, 200_000_000, 30.0, &silences);
+
+        // On prend le silence avant ideal_end même s'il est plus court
+        assert!(
+            (segments[0].1 - 190.5).abs() < 0.5,
+            "Premier cut attendu ≈ 190.5s (silence dans la fenêtre), obtenu {}",
+            segments[0].1
+        );
+    }
+
+    #[test]
+    fn test_equal_distance_prefers_before() {
+        // Fenêtre asymétrique : ideal_end ≈ 196s, window = [166s, 203.5s].
+        // Deux silences de même durée et exactement à la même distance de ideal_end :
+        //   - midpoint 194 (avant, distance 2)
+        //   - midpoint 198 (après, distance 2)
+        // L'avant doit gagner (minimiser le segment).
+        let silences = vec![
+            SilenceInterval { start: 197.5, end: 198.5 }, // après
+            SilenceInterval { start: 193.5, end: 194.5 }, // avant
+        ];
+
+        let segments = compute_cut_points(600.0, 8_000_000.0, 200_000_000, 30.0, &silences);
+
+        assert!(
+            (segments[0].1 - 194.0).abs() < 0.1,
+            "À distance égale, le silence AVANT ideal_end doit gagner. Obtenu {}",
+            segments[0].1
+        );
     }
 
     #[test]

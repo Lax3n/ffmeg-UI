@@ -1,7 +1,11 @@
 use super::commands::*;
-use super::paths::{apply_platform_flags_tokio, ffmpeg_path, ffprobe_path, install_hint};
+use super::keyframes::extract_keyframes;
+use super::paths::{
+    apply_platform_flags, apply_platform_flags_tokio, ffmpeg_path, ffprobe_path, install_hint,
+};
 use super::probe::{probe_file, MediaInfo};
 use super::silence::{build_silence_detect_args, parse_silence_output, SilenceInterval};
+use super::smart_cut::{execute_smart_cut, plan_smart_cut, SourceVideoCodec};
 use crate::ui::TrimMode;
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -32,13 +36,12 @@ impl FFmpegWrapper {
 
     /// Check if FFmpeg is available
     pub fn is_available(&self) -> bool {
-        std::process::Command::new(&self.ffmpeg_path)
-            .arg("-version")
+        let mut cmd = std::process::Command::new(&self.ffmpeg_path);
+        cmd.arg("-version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .stderr(Stdio::null());
+        apply_platform_flags(&mut cmd);
+        cmd.status().map(|s| s.success()).unwrap_or(false)
     }
 
     /// Probe a media file for information
@@ -55,8 +58,45 @@ impl FFmpegWrapper {
         end: f64,
         mode: TrimMode,
     ) -> Result<()> {
+        // SmartCut a un pipeline multi-étapes (extraction keyframes + N fragments + concat)
+        // qui ne se réduit pas à un seul appel ffmpeg → on l'intercepte ici.
+        if mode == TrimMode::SmartCut {
+            return self.smart_trim(input, output, start, end).await;
+        }
         let args = build_trim_args(input, output, start, end, mode);
         self.execute_ffmpeg(&args).await
+    }
+
+    /// Découpe précise à la frame en mode smart-cut.
+    /// Utilise `-c copy` partout où c'est possible et ne ré-encode que les
+    /// portions [start..K_first] et [K_last..end] qui ne tombent pas sur
+    /// des keyframes. Aucun décalage entre segments adjacents.
+    pub async fn smart_trim(
+        &self,
+        input: &PathBuf,
+        output: &PathBuf,
+        start: f64,
+        end: f64,
+    ) -> Result<()> {
+        // Probe + keyframes en parallèle (extraction sync, lance via spawn_blocking)
+        let input_for_probe = input.clone();
+        let info = tokio::task::spawn_blocking(move || probe_file(&input_for_probe))
+            .await
+            .map_err(|e| anyhow!("Probe task failed: {}", e))??;
+
+        let input_for_kf = input.clone();
+        let keyframes = tokio::task::spawn_blocking(move || extract_keyframes(&input_for_kf))
+            .await
+            .map_err(|e| anyhow!("Keyframe task failed: {}", e))?;
+
+        // Tolérance d'alignement = 1 frame (avec une petite marge ε)
+        let fps = info.framerate.unwrap_or(30.0).max(1.0);
+        let tolerance = 1.0 / fps + 0.005;
+
+        let plan = plan_smart_cut(start, end, &keyframes, tolerance);
+        let codec = SourceVideoCodec::from_codec_name(info.video_codec.as_deref());
+
+        execute_smart_cut(input, output, &plan, codec).await
     }
 
     /// Execute an FFmpeg command with the given arguments
