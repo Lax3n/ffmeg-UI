@@ -497,3 +497,70 @@ pub struct TimelineResponse {
     pub is_scrubbing: bool,
     pub zoom_to_fit: bool,
 }
+
+/// Barre de lecture compacte affichant les clips à fusionner bout à bout
+/// (sans zoom ni waveform). Sert de scrub-bar en mode Merge, sous le lecteur.
+///
+/// `current_global` est la position de lecture exprimée sur la durée totale du
+/// merge. Renvoie la position globale (en secondes) si l'utilisateur
+/// clique/scrub, ainsi qu'un drapeau indiquant un scrubbing en cours.
+pub fn clip_seekbar(
+    ui: &mut egui::Ui,
+    clips: &[TimelineClip],
+    total_duration: f64,
+    current_global: f64,
+    height: f32,
+) -> (Option<f64>, bool) {
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+
+    if ui.is_rect_visible(rect) && total_duration > 0.0 {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(30));
+
+        let pixels_per_second = rect.width() / total_duration as f32;
+        let mut offset = 0.0f64;
+        for (i, clip) in clips.iter().enumerate() {
+            let start_x = rect.left() + (offset as f32 * pixels_per_second);
+            offset += clip.duration.max(0.0);
+            let end_x = rect.left() + (offset as f32 * pixels_per_second);
+
+            let (r, g, b) = SEGMENT_COLORS[i % SEGMENT_COLORS.len()];
+            let alpha = if clip.is_current { 220 } else { 130 };
+            let clip_rect = egui::Rect::from_min_max(
+                egui::pos2(start_x, rect.top() + 1.0),
+                egui::pos2(end_x, rect.bottom() - 1.0),
+            );
+            painter.rect_filled(
+                clip_rect,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(r, g, b, alpha),
+            );
+            // Séparation entre clips successifs.
+            if i > 0 {
+                painter.line_segment(
+                    [egui::pos2(start_x, rect.top()), egui::pos2(start_x, rect.bottom())],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(15)),
+                );
+            }
+        }
+
+        // Playhead global.
+        let px = rect.left()
+            + (current_global.clamp(0.0, total_duration) as f32 * pixels_per_second);
+        painter.line_segment(
+            [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 80)),
+        );
+    }
+
+    // Clic ou drag → position globale.
+    if (response.clicked() || response.dragged()) && total_duration > 0.0 {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let rel = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            return (Some(rel as f64 * total_duration), response.dragged());
+        }
+    }
+    (None, false)
+}

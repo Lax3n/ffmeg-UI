@@ -1,6 +1,6 @@
 use crate::app::FFmpegApp;
 use crate::player::PlaybackState;
-use crate::ui::{EditingMode, TimelineClip, TimelineWidget, TrimMode};
+use crate::ui::{clip_seekbar, EditingMode, TimelineClip, TimelineWidget, TrimMode};
 use crate::utils::{format_time, format_size};
 use eframe::egui;
 
@@ -357,24 +357,36 @@ fn render_playback_controls(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         }
     });
 
-    // Seek slider
-    ui.horizontal(|ui| {
-        let mut current = app.current_time;
-        ui.style_mut().spacing.slider_width = ui.available_width() - 20.0;
-
-        let slider_response = ui.add(
-            egui::Slider::new(&mut current, 0.0..=duration.max(0.001))
-                .show_value(false)
-                .trailing_fill(true)
-        );
-
-        if slider_response.changed() {
-            app.seek(current);
+    // Seek bar : barre de clips bout à bout en mode Merge, slider classique sinon.
+    if app.editing_mode == EditingMode::Merge && app.project.files.len() >= 2 {
+        let order = merge_order(app);
+        let (clips, total, global_current) = build_merge_clips(app, &order);
+        let (seek_to, scrubbing) = clip_seekbar(ui, &clips, total, global_current, 18.0);
+        if let Some(t) = seek_to {
+            apply_merge_seek(app, &order, t);
         }
-        if slider_response.dragged() || slider_response.changed() {
+        if scrubbing {
             ui.ctx().request_repaint();
         }
-    });
+    } else {
+        ui.horizontal(|ui| {
+            let mut current = app.current_time;
+            ui.style_mut().spacing.slider_width = ui.available_width() - 20.0;
+
+            let slider_response = ui.add(
+                egui::Slider::new(&mut current, 0.0..=duration.max(0.001))
+                    .show_value(false)
+                    .trailing_fill(true)
+            );
+
+            if slider_response.changed() {
+                app.seek(current);
+            }
+            if slider_response.dragged() || slider_response.changed() {
+                ui.ctx().request_repaint();
+            }
+        });
+    }
 }
 
 fn render_mode_tabs(app: &mut FFmpegApp, ui: &mut egui::Ui) {
@@ -469,11 +481,10 @@ fn render_timeline_panel(app: &mut FFmpegApp, ui: &mut egui::Ui) {
     }
 }
 
-/// Timeline du mode Merge : les fichiers à fusionner sont posés bout à bout,
-/// chacun proportionnel à sa durée, sur la durée totale du merge.
-fn render_merge_timeline(app: &mut FFmpegApp, ui: &mut egui::Ui) {
-    // Ordre effectif des fichiers (merge_file_order s'il est défini, sinon ordre naturel).
-    let order: Vec<usize> = if app.merge_file_order.is_empty() {
+/// Ordre effectif des fichiers à fusionner (merge_file_order s'il est défini,
+/// sinon l'ordre naturel des fichiers du projet).
+fn merge_order(app: &FFmpegApp) -> Vec<usize> {
+    if app.merge_file_order.is_empty() {
         (0..app.project.files.len()).collect()
     } else {
         app.merge_file_order
@@ -481,12 +492,16 @@ fn render_merge_timeline(app: &mut FFmpegApp, ui: &mut egui::Ui) {
             .copied()
             .filter(|&i| i < app.project.files.len())
             .collect()
-    };
+    }
+}
 
+/// Construit les clips de merge + durée totale + position de lecture globale
+/// (offset du fichier courant + temps local).
+fn build_merge_clips(app: &FFmpegApp, order: &[usize]) -> (Vec<TimelineClip>, f64, f64) {
     let mut clips = Vec::with_capacity(order.len());
     let mut total = 0.0;
     let mut playhead_offset = 0.0;
-    for &idx in &order {
+    for &idx in order {
         let file = &app.project.files[idx];
         let dur = file.info.duration.max(0.0);
         let is_current = app.selected_file_index == Some(idx);
@@ -500,9 +515,32 @@ fn render_merge_timeline(app: &mut FFmpegApp, ui: &mut egui::Ui) {
         });
         total += dur;
     }
+    (clips, total, playhead_offset + app.current_time)
+}
 
-    // Le playhead global = position du fichier courant + temps de lecture local.
-    let global_current = playhead_offset + app.current_time;
+/// Applique un seek exprimé sur la durée totale du merge : sélectionne le
+/// fichier sous la position et seek à l'instant local correspondant.
+fn apply_merge_seek(app: &mut FFmpegApp, order: &[usize], global_t: f64) {
+    let mut acc = 0.0;
+    for (pos, &idx) in order.iter().enumerate() {
+        let dur = app.project.files[idx].info.duration.max(0.0);
+        let is_last = pos + 1 == order.len();
+        if global_t < acc + dur || is_last {
+            if app.selected_file_index != Some(idx) {
+                app.select_file(idx);
+            }
+            app.seek((global_t - acc).clamp(0.0, dur));
+            return;
+        }
+        acc += dur;
+    }
+}
+
+/// Timeline du mode Merge : les fichiers à fusionner sont posés bout à bout,
+/// chacun proportionnel à sa durée, sur la durée totale du merge.
+fn render_merge_timeline(app: &mut FFmpegApp, ui: &mut egui::Ui) {
+    let order = merge_order(app);
+    let (clips, total, global_current) = build_merge_clips(app, &order);
 
     let response = TimelineWidget::new(total, global_current)
         .zoom(app.timeline_zoom)
@@ -512,19 +550,7 @@ fn render_merge_timeline(app: &mut FFmpegApp, ui: &mut egui::Ui) {
 
     // Un clic sélectionne le fichier survolé et seek à la position locale correspondante.
     if let Some(t) = response.seek_to {
-        let mut acc = 0.0;
-        for (pos, &idx) in order.iter().enumerate() {
-            let dur = app.project.files[idx].info.duration.max(0.0);
-            let is_last = pos + 1 == order.len();
-            if t < acc + dur || is_last {
-                if app.selected_file_index != Some(idx) {
-                    app.select_file(idx);
-                }
-                app.seek((t - acc).clamp(0.0, dur));
-                break;
-            }
-            acc += dur;
-        }
+        apply_merge_seek(app, &order, t);
     }
     if let Some(zoom) = response.zoom_changed {
         app.timeline_zoom = zoom;
